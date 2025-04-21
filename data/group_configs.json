@@ -1,0 +1,25 @@
+{
+  "-1002468752565": {
+    "token_key": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "config": {
+      "admin_user_id": 5295996054,
+      "notifications_enabled": true,
+      "notification_threshold": 1,
+      "setup_complete": true,
+      "is_active": true,
+      "updated_at": "2025-04-20T15:21:47.108222+00:00"
+    }
+  },
+  "-1002331327897": {
+    "token_key": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "config": {
+      "admin_user_id": 5295996054,
+      "notifications_enabled": true,
+      "notification_threshold": 1,
+      "group_link": "https://t.me/Squonking",
+      "setup_complete": true,
+      "is_active": true,
+      "updated_at": "2025-04-21T09:03:51.390351+00:00"
+    }
+  }
+}

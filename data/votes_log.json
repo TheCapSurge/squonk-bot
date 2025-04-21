@@ -1,0 +1,92 @@
+[
+  {
+    "user_id": 5295996054,
+    "contract_chain": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "timestamp": "2025-04-20T15:21:55.428864+00:00"
+  },
+  {
+    "user_id": 5288154727,
+    "contract_chain": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "timestamp": "2025-04-20T15:23:34.181375+00:00"
+  },
+  {
+    "user_id": 7105323025,
+    "contract_chain": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "timestamp": "2025-04-20T15:29:44.454238+00:00"
+  },
+  {
+    "user_id": 7035652083,
+    "contract_chain": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "timestamp": "2025-04-20T15:35:47.740120+00:00"
+  },
+  {
+    "user_id": 1918624551,
+    "user_name": "squonky2",
+    "contract_chain": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "timestamp": "2025-04-20T17:13:28.455510+00:00",
+    "is_free_vote": false
+  },
+  {
+    "user_id": 7035652083,
+    "user_name": "TheOneTheOneTheOne",
+    "contract_chain": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "timestamp": "2025-04-20T20:19:56.281813+00:00",
+    "is_free_vote": false
+  },
+  {
+    "user_id": 6687107735,
+    "user_name": "Mambamambu",
+    "contract_chain": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "timestamp": "2025-04-20T20:31:43.007124+00:00",
+    "is_free_vote": false
+  },
+  {
+    "user_id": 5295996054,
+    "user_name": "CertainlyNotNakamoto",
+    "contract_chain": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "timestamp": "2025-04-20T22:16:25.386637+00:00",
+    "is_free_vote": false
+  },
+  {
+    "user_id": 1918624551,
+    "user_name": "squonky2",
+    "contract_chain": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "timestamp": "2025-04-21T04:54:28.445756+00:00",
+    "is_free_vote": false
+  },
+  {
+    "user_id": 1918624551,
+    "user_name": "squonky2",
+    "contract_chain": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "timestamp": "2025-04-21T05:13:31.193270+00:00",
+    "is_free_vote": true
+  },
+  {
+    "user_id": 7035652083,
+    "user_name": "TheOneTheOneTheOne",
+    "contract_chain": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "timestamp": "2025-04-21T06:19:07.049114+00:00",
+    "is_free_vote": true
+  },
+  {
+    "user_id": 7035652083,
+    "user_name": "TheOneTheOneTheOne",
+    "contract_chain": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "timestamp": "2025-04-21T08:05:18.673803+00:00",
+    "is_free_vote": false
+  },
+  {
+    "user_id": 5295996054,
+    "user_name": "CertainlyNotNakamoto",
+    "contract_chain": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "timestamp": "2025-04-21T08:18:50.501300+00:00",
+    "is_free_vote": false
+  },
+  {
+    "user_id": 1918624551,
+    "user_name": "squonky2",
+    "contract_chain": "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol",
+    "timestamp": "2025-04-21T08:57:24.475197+00:00",
+    "is_free_vote": false
+  }
+]

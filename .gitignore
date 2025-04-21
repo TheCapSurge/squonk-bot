@@ -1,0 +1,25 @@
+# Environment variables
+.env
+
+# Python virtual environment
+venv/
+**/venv/
+*/venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data files (optional - decide if you want to track data)
+# If you DON'T want data backed up on Git (recommended for user data), uncomment the next line:
+# data/
+
+# IDE / Editor specific files (examples)
+.vscode/
+.idea/
+*.swp
+
+# OS specific files
+.DS_Store
+Thumbs.db

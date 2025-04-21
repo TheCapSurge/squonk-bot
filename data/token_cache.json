@@ -1,0 +1,20 @@
+{
+  "2vtphlltj6n6um1jrtgorcz6evsxfwftibbafa8kpump_sol": {
+    "name": "SQUONK",
+    "symbol": "SQUONK",
+    "group_link": "https://t.me/Squonking",
+    "market_cap_usd": 11011.0,
+    "price_usd": 1.101e-05,
+    "first_mcap_usd": 11011.0,
+    "first_mcap_timestamp": "2025-04-21T09:06:36.246046+00:00",
+    "fetch_timestamp": "2025-04-21T10:41:26.818125+00:00",
+    "price_change_h24": 5.76,
+    "volume_h24": 391.17,
+    "url": "https://dexscreener.com/solana/8mblr5thhfhevarnrpij47uvjtrvpw4nevim6dkt2afy",
+    "price_native": 7.844e-08,
+    "liquidity_usd": 10528.4,
+    "dex_id": "raydium",
+    "pair_address": "8MBLr5THhfHevaRNrpij47uvjtRVpw4NeviM6dkt2afy",
+    "holders": null
+  }
+}
