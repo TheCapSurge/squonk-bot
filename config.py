@@ -47,8 +47,9 @@ SCOREBOARD_TITLE = "🔥 Live Trending Tokens 🔥"
 SCOREBOARD_TOP_N = 10 # Tokens on vote-based scoreboard
 
 # --- Notification Settings ---
-VOTE_IMAGE_FILENAMES = ["squonk_vote1.png", "squonk_vote2.png"] # List of image filenames in IMAGES_DIR
-PROMO_URL = "https://squonk.meme" # Optional URL for promotion buttons/text
+VOTE_IMAGE_FILENAMES = ["squonk_vote1.png", "squonk_vote2.png"]
+VOTE_PROMPT_IMAGE = "vote_prompt.png" # <<< ADDED: Image for the /vote command reply in group
+PROMO_URL = "https://squonk.meme"
 
 GAINERS_POST_IMAGE = "gainers.png"         # Image for /trending or biggest gainers post
 LEADERBOARD_ENTRY_IMAGE = "leaderboard.png" # Image for when a token enters the leaderboard

@@ -1577,15 +1577,15 @@ async def cancel_setup(callback: CallbackQuery, state: FSMContext):
 
 # --- <<< MODIFIED VOTING FLOW >>> ---
 
-async def process_vote_action(user_id: int, user_name: str, token_key: str) -> typing.Tuple[str, bool]:
+# --- Modify process_vote_action to return markup on failure ---
+async def process_vote_action(user_id: int, user_name: str, token_key: str) -> typing.Tuple[str, bool, typing.Optional[InlineKeyboardMarkup]]:
     """
     Handles the core logic of processing a vote attempt.
     Checks membership, cooldowns, free votes, logs vote, saves data.
-    Returns a tuple: (result_message: str, vote_succeeded: bool).
-    Does NOT send messages directly to user/group anymore (except maybe group notifs).
+    Returns a tuple: (result_message: str, vote_succeeded: bool, join_markup: Optional[InlineKeyboardMarkup]).
     """
     user_id_str = str(user_id);
-    safe_user_name = user_name.replace('<', '&lt;').replace('>', '&gt;');
+    safe_user_name = user_name.replace('<', '<').replace('>', '>');
     logger.info(f"Processing vote action logic for user {user_id} ({safe_user_name}), token {token_key}")
     try:
         token_display = await get_token_display_info(token_key)
@@ -1597,15 +1597,41 @@ async def process_vote_action(user_id: int, user_name: str, token_key: str) -> t
     logger.debug(f"Checking main channel/group membership for user {user_id}")
     in_channel, in_group = await check_main_membership(user_id)
     if not in_channel or not in_group:
+        join_markup_builder = InlineKeyboardBuilder();
+        bot_info = await bot.get_me()
+
+        async def add_join_button_vote(chat_id_config: typing.Union[int, str], text: str, chat_name_log: str):
+            """Inner helper to add join buttons"""
+            url = None;
+            if not chat_id_config: logger.debug(f"Join button {text} skipped: ID not configured."); return
+            try:
+                chat_id_for_link = None; invite_link_chat_id = None
+                if isinstance(chat_id_config, str) and chat_id_config.startswith("@"): url = f"https://t.me/{chat_id_config.lstrip('@')}"; chat_id_for_link = chat_id_config
+                elif isinstance(chat_id_config, int): chat_id_for_link = chat_id_config; invite_link_chat_id = chat_id_config
+                elif isinstance(chat_id_config, str) and chat_id_config.lstrip('-').isdigit(): numeric_id = int(chat_id_config); chat_id_for_link = numeric_id; invite_link_chat_id = numeric_id
+                else: logger.error(f"Invalid chat ID format {chat_id_config} for {text} button in vote check."); return
+
+                if invite_link_chat_id and not url:
+                    logger.debug(f"Attempting invite link creation for {chat_name_log} ({invite_link_chat_id})")
+                    try: link = await bot.create_chat_invite_link(invite_link_chat_id, member_limit=1); url = link.invite_link
+                    except Exception as e: logger.warning(f"Could not create invite link for {chat_name_log} ({invite_link_chat_id}) in vote check: {e}. Using fallback."); url = f"https://t.me/{bot_info.username}?start=request_join_{chat_id_for_link}"
+
+                if url: join_markup_builder.button(text=text, url=url); logger.debug(f"Added join button for {text}")
+                else: logger.warning(f"Could not generate URL for join button {text} ({chat_id_for_link}) in vote check")
+            except Exception as e: logger.error(f"Error creating vote check join button for {chat_id_config}: {e}")
+
         missing_reqs = []
-        if not in_channel: missing_reqs.append("main channel")
-        if not in_group: missing_reqs.append("main group")
+        if not in_channel: missing_reqs.append("main channel"); await add_join_button_vote(config.MAIN_CHANNEL_ID, "➡️ Join Main Channel", "Main Channel")
+        if not in_group: missing_reqs.append("main group"); await add_join_button_vote(config.MAIN_GROUP_ID, "➡️ Join Main Group", "Main Group")
+
+        join_markup_builder.adjust(1);
+        final_markup = join_markup_builder.as_markup() if join_markup_builder.buttons else None
         reason = ' and '.join(missing_reqs)
         logger.warning(f"Vote logic failed for user {user_id}: Not member of {reason}.")
-        # Return failure message and False status
-        return (f"⚠️ Vote Failed! You must be a member of the {reason} to vote.", False) # Markup handled elsewhere now
+        # --- Return failure message, False status, and the markup ---
+        return (f"⚠️ Vote Failed! You must be a member of the {reason} to vote.\nPlease join using the button(s) below and try voting again.", False, final_markup)
 
-    # 2. Check for Free Votes FIRST
+    # --- (Rest of the function: cooldown check, free vote check, logging, saving - remains the same) ---
     used_free_vote = False
     data_changed = False # Flag if save is needed
     logger.debug(f"Checking free votes for user {user_id_str}, token {token_key}")
@@ -1615,79 +1641,53 @@ async def process_vote_action(user_id: int, user_name: str, token_key: str) -> t
         used_free_vote = True;
         data_changed = True
         logger.info(f"User {user_id} used a free vote for {token_key}. Remaining free for this token: {remaining_free}")
-        # Clean up if count reaches zero
-        if user_free_votes[user_id_str][token_key] <= 0:
-             del user_free_votes[user_id_str][token_key];
-             logger.debug(f"Removed free vote entry for token {token_key} for user {user_id_str} as count is zero.")
-        # Clean up user entry if no more free votes for any token
-        if not user_free_votes[user_id_str]:
-             del user_free_votes[user_id_str];
-             logger.debug(f"Removed user entry {user_id_str} from user_free_votes as it's empty.")
+        if user_free_votes[user_id_str][token_key] <= 0: del user_free_votes[user_id_str][token_key];
+        if not user_free_votes[user_id_str]: del user_free_votes[user_id_str];
     else:
-        # 3. Check Regular Vote Cooldown (only if no free vote was used)
         logger.debug(f"No free votes found/used for {user_id_str}/{token_key}. Checking regular cooldown.")
-        cooldown = get_cooldown_remaining(user_id, token_key) # This helper now cleans expired entries
+        cooldown = get_cooldown_remaining(user_id, token_key)
         if cooldown:
-            # Cooldown active, prevent vote
             logger.info(f"Vote logic denied for user {user_id} on {token_key} due to active cooldown: {format_timedelta(cooldown)} remaining.")
-            return (f"⏳ Cooldown active! You recently voted for {token_display}.\nTry again in <b>{format_timedelta(cooldown)}</b>.", False)
+            return (f"⏳ Cooldown active! You recently voted for {token_display}.\nTry again in <b>{format_timedelta(cooldown)}</b>.", False, None) # No markup on cooldown
         else:
-             # No free vote used and no cooldown active -> Proceed with regular vote
              logger.debug(f"No active cooldown for user {user_id}, token {token_key}. Proceeding with regular vote.")
-             # If get_cooldown_remaining returned None, it might have cleaned up data, check if save needed
-             # Check the main dict directly as helper modifies it
              if user_id_str in user_votes and token_key not in user_votes.get(user_id_str, {}):
                  data_changed = True # Cooldown was cleaned up
 
-    # 4. Record the Vote (Regular or Free)
     now = datetime.now(timezone.utc); now_iso = now.isoformat()
-    # Add regular vote cooldown timestamp *only* if it wasn't a free vote
     if not used_free_vote:
         if user_id_str not in user_votes: user_votes[user_id_str] = {};
-        user_votes[user_id_str][token_key] = now_iso # Set cooldown timestamp
+        user_votes[user_id_str][token_key] = now_iso
         logger.info(f"Recorded regular vote for user {user_id}, token {token_key}. Cooldown started.")
         data_changed = True
     else:
         logger.info(f"Recording free vote for user {user_id}, token {token_key}.")
 
-    # Log the vote action
-    log_entry = {
-        "user_id": user_id,
-        "user_name": user_name, # Store original username if available
-        "contract_chain": token_key,
-        "timestamp": now_iso,
-        "is_free_vote": used_free_vote
-    };
+    log_entry = { "user_id": user_id, "user_name": user_name, "contract_chain": token_key, "timestamp": now_iso, "is_free_vote": used_free_vote };
     votes_log.append(log_entry)
-    data_changed = True # Vote log always changes
+    data_changed = True
     logger.debug(f"Appended vote log entry: {log_entry}")
 
-    # Save data changes IF any occurred (cooldown added/cleaned, free vote used, log updated)
     if data_changed:
         logger.debug("Data changed, saving vote action state.")
         await save_data()
     else:
          logger.debug("No data changes detected after vote processing.")
 
-    # 5. Send Notification to Associated Group(s) if needed (Optional based on design)
-    # DECISION: Keep group notifications for now, triggered by successful vote.
     await send_vote_notification_to_groups(user_id, safe_user_name, token_key, used_free_vote, token_display)
 
-    # 6. Format and return success message
     success_message = f"✅ Vote cast successfully for <b>{token_display}</b>!\n\n"
     if used_free_vote:
-        # Re-fetch remaining count for accuracy after decrement
         remaining_free = user_free_votes.get(user_id_str, {}).get(token_key, 0);
         success_message = f"✅ Free vote used for <b>{token_display}</b>!\n"
         success_message += f"You have {remaining_free} free vote(s) left for this token.\n\n"
         success_message += f"Your regular vote cooldown for {token_display} is unaffected."
         logger.info(f"Vote success message (free vote) generated for user {user_id}")
     else:
-        # If regular vote, mention the cooldown period
         success_message += f"You can cast your next regular vote for this token in {config.VOTE_COOLDOWN_HOURS} hours."
         logger.info(f"Vote success message (regular vote) generated for user {user_id}")
 
-    return (success_message, True) # Return success message and True status
+    return (success_message, True, None) # <<< Return success message, True status, and None for markup
 
 
 async def send_vote_notification_to_groups(user_id: int, safe_user_name: str, token_key: str, used_free_vote: bool, token_display: str):
@@ -1799,7 +1799,7 @@ async def send_vote_notification_to_groups(user_id: int, safe_user_name: str, to
 
 @router.message(Command("vote"), F.chat.type.in_([ChatType.GROUP, ChatType.SUPERGROUP]))
 async def handle_vote_in_group(message: Message):
-    """Handles the /vote command: Sends a button reply in the group."""
+    """Handles the /vote command: Sends a photo/caption with a button reply in the group."""
     group_id_str = str(message.chat.id);
     user = message.from_user;
     user_name = user.username if user.username else user.first_name;
@@ -1822,21 +1822,40 @@ async def handle_vote_in_group(message: Message):
         logger.error(f"Failed to get token display info for {token_key} in /vote command: {e}")
         token_display = "this token" # Fallback display
 
-    # Create the button to initiate the DM confirmation
+    # --- Prepare Button ---
     builder = InlineKeyboardBuilder()
-    # Use a unique prefix for this type of button
     builder.button(text=f"➡️ Click here to Vote for {token_display}", callback_data=f"vote_request_{token_key}")
+    markup = builder.as_markup()
 
-    await message.reply(
-        f"🗳️ Ready to vote for {hbold(token_display)}?\nClick the button below to confirm your vote in a private message.",
-        reply_markup=builder.as_markup()
-    )
+    # --- Prepare Caption ---
+    caption = f"🗳️ Ready to vote for {hbold(token_display)}?\nClick the button below to confirm your vote in a private message."
 
-@router.message(Command("vote"), F.chat.type == ChatType.PRIVATE)
-async def handle_vote_in_dm(message: Message):
-    """Informs users they cannot initiate vote in DM."""
-    logger.info(f"User {message.from_user.id} tried to use /vote in DM.")
-    await message.reply("Please use the /vote command inside the specific token's Telegram group first.")
+    # --- Prepare Photo ---
+    photo_input = None
+    photo_filename = getattr(config, 'VOTE_PROMPT_IMAGE', None)
+    if photo_filename:
+        potential_path = os.path.join(config.IMAGES_DIR, photo_filename)
+        if os.path.isfile(potential_path):
+            photo_input = FSInputFile(potential_path)
+            logger.debug(f"Using vote prompt image: {potential_path}")
+        else:
+            logger.warning(f"Vote prompt image '{photo_filename}' not found in {config.IMAGES_DIR}. Sending text only.")
+
+    # --- Send Message or Photo ---
+    try:
+        if photo_input:
+            await message.reply_photo(photo=photo_input, caption=caption, reply_markup=markup)
+        else:
+            await message.reply(caption, reply_markup=markup)
+    except Exception as e:
+        logger.exception(f"Failed to send vote prompt reply (photo or text) to group {message.chat.id}: {e}")
+        # Fallback to simple text reply if photo fails unexpectedly
+        if photo_input:
+            try:
+                await message.reply(caption, reply_markup=markup)
+            except Exception as fallback_e:
+                 logger.error(f"Failed to send fallback text vote prompt reply to group {message.chat.id}: {fallback_e}")
+
 
 @router.callback_query(F.data.startswith("vote_request_"))
 async def handle_vote_request_button(callback: CallbackQuery):
@@ -1844,6 +1863,7 @@ async def handle_vote_request_button(callback: CallbackQuery):
     user_id = callback.from_user.id
     logger.info(f"User {user_id} clicked vote request button: {callback.data}")
     try:
+        # Extract token key from callback data like "vote_request_0x123_eth"
         token_key = callback.data.split("vote_request_", 1)[1]
         if not token_key: raise ValueError("Token key missing")
     except (IndexError, ValueError) as e:
@@ -1852,39 +1872,48 @@ async def handle_vote_request_button(callback: CallbackQuery):
         return
 
     try:
+        # Get display name for the button in DM
         token_display = await get_token_display_info(token_key)
     except Exception as e:
         logger.error(f"Failed to get token display info for {token_key} in vote_request handler: {e}")
-        token_display = "this token"
+        token_display = "this token" # Fallback
 
     # Create the confirmation button for DM
     builder = InlineKeyboardBuilder()
-    # Use a different prefix for the confirmation button
+    # Use a different prefix ("vote_confirm_") for the confirmation button
     builder.button(text=f"✅ Confirm Vote for {token_display}", callback_data=f"vote_confirm_{token_key}")
+    markup = builder.as_markup()
 
     # Try sending the confirmation message to the user's DM
     try:
         await bot.send_message(
             chat_id=user_id,
             text=f"Please confirm your vote for <b>{token_display}</b> by clicking the button below:",
-            reply_markup=builder.as_markup()
+            reply_markup=markup
         )
-        # Answer the group callback silently to remove the loading spinner
+        # Answer the group callback silently to remove the loading spinner from the original button
         await callback.answer()
         logger.info(f"Sent vote confirmation DM to user {user_id} for token {token_key}")
     except (TelegramForbiddenError, TelegramBadRequest) as e:
         err_msg = str(e).lower()
-        if "blocked" in err_msg or "deactivated" in err_msg or "bot was blocked" in err_msg or "chat not found" in err_msg:
-            logger.warning(f"Cannot send vote confirmation DM to user {user_id}: Bot blocked or chat not found.")
-            await callback.answer("Could not send confirmation DM. Have you started a chat with me and not blocked me?", show_alert=True)
+        alert_message = "Could not send confirmation DM."
+        # Provide more helpful error messages
+        if "blocked" in err_msg or "deactivated" in err_msg or "bot was blocked" in err_msg:
+            logger.warning(f"Cannot send vote confirmation DM to user {user_id}: Bot blocked or user deactivated.")
+            alert_message = "Could not send DM. Please start a chat with me first (click my username) and ensure you haven't blocked me."
+        elif "chat not found" in err_msg:
+             logger.warning(f"Cannot send vote confirmation DM to user {user_id}: Chat not found (user deleted account?).")
+             alert_message = "Could not send DM. Unable to find chat with user."
         else:
             logger.error(f"Error sending vote confirmation DM to user {user_id}: {e}")
-            await callback.answer("An error occurred trying to send the confirmation message.", show_alert=True)
+            alert_message = "An error occurred trying to send the confirmation message via DM."
+        # Show the error to the user who clicked the button in the group
+        await callback.answer(alert_message, show_alert=True)
     except Exception as e:
         logger.exception(f"Unexpected error sending vote confirmation DM to user {user_id}: {e}")
-        await callback.answer("An unexpected error occurred.", show_alert=True)
+        await callback.answer("An unexpected server error occurred.", show_alert=True)
 
-
+# --- Modify handle_vote_confirm_button to show join links ---
 @router.callback_query(F.data.startswith("vote_confirm_"))
 async def handle_vote_confirm_button(callback: CallbackQuery):
     """Handles the confirmation button clicked in DM."""
@@ -1899,14 +1928,14 @@ async def handle_vote_confirm_button(callback: CallbackQuery):
     except (IndexError, ValueError) as e:
         logger.error(f"Failed to parse token_key from vote_confirm callback: {callback.data}, Error: {e}")
         await callback.answer("Error: Could not identify the token from this button.", show_alert=True)
-        # Try to edit the message to show error
         try: await message.edit_text("❌ Error identifying token. Please try voting again from the group.")
         except: pass
         return
 
-    # Process the vote action logic (checks cooldowns, logs vote, saves)
+    # Process the vote action logic
     try:
-        result_message, vote_succeeded = await process_vote_action(user.id, user_name, token_key)
+        # --- Capture join_markup if vote fails due to membership ---
+        result_message, vote_succeeded, join_markup = await process_vote_action(user.id, user_name, token_key)
     except Exception as e:
          logger.exception(f"Unexpected error during process_vote_action for user {user.id}, token {token_key} (confirm step): {e}")
          await callback.answer("An unexpected error occurred while processing your vote.", show_alert=True)
@@ -1916,14 +1945,17 @@ async def handle_vote_confirm_button(callback: CallbackQuery):
 
     # Show result to user (edit the DM message)
     try:
-        await message.edit_text(result_message, reply_markup=None, disable_web_page_preview=True) # Remove button after processing
-        # Answer callback silently if edit succeeds
-        await callback.answer()
+        # --- Include join_markup if vote failed for membership ---
+        await message.edit_text(
+            result_message,
+            reply_markup=join_markup if not vote_succeeded and join_markup else None, # Show join buttons only on specific failure
+            disable_web_page_preview=True
+        )
+        await callback.answer() # Answer silently unless error below
         logger.info(f"Vote processed for user {user.id}, token {token_key}. Success: {vote_succeeded}. Result msg sent to DM.")
     except Exception as e:
         logger.error(f"Failed to edit DM message or answer callback after vote confirmation for user {user.id}: {e}")
-        # If editing fails, still try to answer the callback with the primary message
-        await callback.answer(result_message.split('\n')[0], show_alert=True)
+        await callback.answer(result_message.split('\n')[0], show_alert=True) # Show basic result in alert on edit fail
 
     # If vote succeeded, send the follow-up minigame prompt
     if vote_succeeded:
@@ -1936,13 +1968,6 @@ async def handle_vote_confirm_button(callback: CallbackQuery):
             logger.info(f"Sent minigame prompt DM to user {user.id}")
         except Exception as e:
             logger.warning(f"Failed to send minigame prompt DM to user {user.id}: {e}")
-
-# Remove or comment out the old button handler if no longer needed
-# @router.callback_query(F.data.startswith("vote_"))
-# async def handle_vote_button(callback: CallbackQuery):
-#    # ... (old logic) ...
-#    logger.warning(f"Old vote_ handler triggered for {callback.data}. This might be deprecated.")
-#    await callback.answer("This button might be outdated. Please use /vote in the group.", show_alert=True)
 
 
 # --- Cooldown/Free Vote Check Commands --- (Keep as is)
@@ -2587,9 +2612,8 @@ async def send_pumping_notification(token_key: str, multiplier: int, current_mca
     await send_main_channel_notification(text, photo_url=photo_input, reply_markup=markup)
 
 
-
 async def send_leaderboard_entry_notification(token_key: str, rank: int, current_mcap: float):
-    """Formats and sends the 'Entered Leaderboard' notification, potentially with image."""
+    """Formats and sends 'Entered Leaderboard' notification, including the current leaderboard."""
     logger.info(f"Formatting 'Leaderboard Entry' notification for {token_key} (Rank {rank})")
     token_info = token_cache.get(token_key, {});
     token_display = await get_token_display_info(token_key, include_symbol=True);
@@ -2597,11 +2621,33 @@ async def send_leaderboard_entry_notification(token_key: str, rank: int, current
     dex_link = token_info.get('url') # Dexscreener link
     contract_addr = token_key.split('_')[0] if '_' in token_key else token_key
 
+    # --- Generate Leaderboard Snippet ---
+    leaderboard_lines = []
+    trending_tokens = get_trending_tokens(config.TRENDING_WINDOW_HOURS)
+    for i, (t_key, vote_count) in enumerate(trending_tokens[:config.SCOREBOARD_TOP_N]):
+        lb_rank = i + 1
+        lb_emoji = ""
+        if lb_rank == 1: lb_emoji = "🥇"
+        elif lb_rank == 2: lb_emoji = "🥈"
+        elif lb_rank == 3: lb_emoji = "🥉"
+        else: lb_emoji = f"{lb_rank}."
+        try:
+            lb_token_display = await get_token_display_info(t_key)
+        except:
+            lb_token_display = f"Token {t_key[:4]}..."
+        leaderboard_lines.append(f"{lb_emoji} {lb_token_display} ({vote_count} votes)")
+
+    leaderboard_text = "\n".join(leaderboard_lines) if leaderboard_lines else "<i>Leaderboard data unavailable.</i>"
+    # --- ---
+
     text = (f"🏆 {hbold(token_display)} entered Top {config.SCOREBOARD_TOP_N} Trending Leaderboard at #{rank}!\n\n"
-            f"🔸 CA: {hcode(contract_addr)}\n")
-    if group_link:
-        text += f"🔸 Group: {hlink('Join Chat', group_link)}\n"
-    text += f"🔸 Marketcap: ${current_mcap:,.0f}\n"
+            f"🔸 CA: {hcode(contract_addr)}\n"
+            f"🔸 Marketcap: ${current_mcap:,.0f}\n\n"
+            f"--- <b>Current Leaderboard ({config.TRENDING_WINDOW_HOURS}h)</b> ---\n"
+            f"{leaderboard_text}") # Append leaderboard
+
+    if group_link: # Add group link below leaderboard if available
+        text += f"\n\n➡️ {hlink('Join the Chat!', group_link)}"
 
     keyboard = InlineKeyboardBuilder();
     if dex_link: keyboard.button(text="📊 Chart (DexScreener)", url=dex_link);
@@ -2622,8 +2668,78 @@ async def send_leaderboard_entry_notification(token_key: str, rank: int, current
     photo_input = FSInputFile(image_path) if image_path else None
     await send_main_channel_notification(text, photo_url=photo_input, reply_markup=markup)
 
+def get_top_voters_for_token(token_key: str, limit: int = 10) -> typing.List[typing.Tuple[int, str, int]]:
+    """
+    Counts votes per user for a specific token_key from votes_log.
+    Returns list of tuples: (user_id, user_name, vote_count)
+    """
+    if not token_key:
+        return []
 
+    voters = defaultdict(lambda: {"count": 0, "name": "Unknown User"})
+    for vote in votes_log:
+        if vote.get("contract_chain") == token_key:
+            user_id = vote.get("user_id")
+            if user_id:
+                voters[user_id]["count"] += 1
+                # Update name if available and different from default
+                user_name = vote.get("user_name")
+                if user_name and voters[user_id]["name"] == "Unknown User":
+                    voters[user_id]["name"] = user_name # Store last known name
 
+    # Sort by vote count descending
+    sorted_voters = sorted(voters.items(), key=lambda item: item[1]["count"], reverse=True)
+
+    # Format output
+    top_voters_list = []
+    for user_id, data in sorted_voters[:limit]:
+        top_voters_list.append((user_id, data["name"], data["count"]))
+
+    return top_voters_list
+
+@router.message(Command("top"), F.chat.type.in_([ChatType.GROUP, ChatType.SUPERGROUP]))
+async def handle_top_command(message: Message):
+    """Handles the /top command to show top voters for the group's token."""
+    group_id_str = str(message.chat.id);
+    user = message.from_user;
+    logger.info(f"User {user.id} requested /top in group {group_id_str}")
+
+    # Check if group is configured
+    group_data = group_configs.get(group_id_str)
+    if not group_data or not group_data.get("config", {}).get("setup_complete"):
+        await message.reply("This group isn't configured yet."); return
+
+    token_key = group_data.get("token_key");
+    if not token_key:
+        await message.reply("Configuration error (missing token key)."); return
+
+    try:
+        token_display = await get_token_display_info(token_key)
+        top_voters = get_top_voters_for_token(token_key, limit=10) # Get top 10
+    except Exception as e:
+        logger.exception(f"Error getting top voters for {token_key} in group {group_id_str}: {e}")
+        await message.reply("An error occurred while fetching top voters.")
+        return
+
+    if not top_voters:
+        await message.reply(f"No votes recorded yet for {hbold(token_display)} in the log.")
+        return
+
+    # Format the reply
+    reply_lines = [f"🏆 <b>Top {len(top_voters)} Voters for {token_display}</b> 🏆\n"]
+    for i, (user_id, user_name, vote_count) in enumerate(top_voters):
+        rank = i + 1
+        # Sanitize username for display
+        safe_name = user_name.replace('<', '<').replace('>', '>') if user_name else f"User ID {user_id}"
+        # Try to create a user link
+        user_link = f"<a href='tg://user?id={user_id}'>{safe_name}</a>"
+        reply_lines.append(f"{rank}. {user_link} - <b>{vote_count}</b> votes")
+
+    # Add timestamp? Optional
+    # now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+    # reply_lines.append(f"\n<i>Data from vote log as of {now_utc}</i>")
+
+    await message.reply("\n".join(reply_lines), disable_web_page_preview=True)
 
 async def send_biggest_gainers_post():
     """Fetches data, calculates gainers, and posts the list, potentially with image."""
