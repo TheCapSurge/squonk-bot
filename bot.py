@@ -2976,84 +2976,59 @@ async def periodic_market_data_update():
     """Background task to fetch market data and trigger notifications using Redis for state."""
     if not redis_client:
         logger.error("Redis client not available at start of periodic_market_data_update. Task cannot run.")
-        return # Cannot run without Redis
+        return
 
-    global http_session, last_gainers_post_time # last_gainers_post_time still loaded from JSON state file initially
+    global http_session, last_gainers_post_time
     await asyncio.sleep(30); logger.info("Periodic market data fetcher task started (using Redis state).")
 
     while True:
         update_interval_seconds = config.MARKET_DATA_UPDATE_INTERVAL_MINUTES * 60
-        try: # <<< START OF MAIN TRY BLOCK FOR THE CYCLE
-            now = datetime.now(timezone.utc);
-            rate_limit_hit = False;
-            data_changed_json = False # Flag for saving JSON parts if needed
+        try: # Outer try for the whole cycle
+            now = datetime.now(timezone.utc); rate_limit_hit = False; data_changed_json = False
 
-            tracked_token_keys = list(token_cache.keys()) # Get tokens to check
+            tracked_token_keys = list(token_cache.keys())
             if not tracked_token_keys:
                 logger.info("No tokens configured, skipping market data fetch cycle.");
-                # await asyncio.sleep(update_interval_seconds); # Sleep moved to finally block
-                continue # Skip rest of the loop if no tokens
+                await asyncio.sleep(update_interval_seconds); continue
 
             logger.info(f"Starting market data fetch cycle for {len(tracked_token_keys)} tokens...")
 
-            # --- Token Fetch Loop ---
             for token_key in tracked_token_keys:
-                if rate_limit_hit:
-                    logger.warning("Rate limit previously hit in this cycle, ending fetch loop early.")
-                    break # Exit token loop if rate limit was hit
-
+                if rate_limit_hit: logger.warning("Rate limit hit, ending fetch loop early."); break
                 contract_address = token_key.split('_')[0] if '_' in token_key else token_key
-
-                # Ensure session exists and is open
                 if not http_session or http_session.closed:
-                    logger.warning("aiohttp session was closed or None. Recreating session for market data fetch.");
-                    try:
-                        # Close previous session just in case before recreating
-                        if http_session: await http_session.close()
-                    except Exception as close_err: logger.error(f"Error closing previous http_session: {close_err}")
+                    logger.warning("Recreating aiohttp session.");
+                    if http_session: await http_session.close()
                     http_session = aiohttp.ClientSession()
+                new_data = None
+                try: new_data = await fetch_token_data_dexscreener(http_session, contract_address)
+                except ConnectionError as e: logger.error(f"Rate limit hit fetching {token_key}: {e}. Pausing."); rate_limit_hit = True; break
+                except Exception as e: logger.exception(f"Unhandled fetch error {token_key}: {e}"); new_data = None
 
-                new_data = None # Reset new_data for each token
-                try:
-                    new_data = await fetch_token_data_dexscreener(http_session, contract_address)
-                except ConnectionError as e: # Catch rate limit error specifically
-                    logger.error(f"Rate limit hit while fetching {token_key}: {e}. Pausing fetch cycle.");
-                    rate_limit_hit = True;
-                    break # Exit token loop immediately on rate limit
-                except Exception as e:
-                     # Catch other errors during fetch
-                    logger.exception(f"Unhandled error fetching market data for {token_key}: {e}");
-                    new_data = None # Ensure new_data is None on error
-
-                # --- Process Fetched Data ---
                 if new_data:
-                    logger.debug(f"Successfully fetched data for {token_key}. Processing...")
-                    redis_state_updates = {} # Collect Redis HSET updates for this token
+                    logger.debug(f"Processing fetched data for {token_key}...")
+                    redis_state_updates = {}
 
-                    # Update token_cache (still JSON for now)
                     if token_key not in token_cache or new_data.get('fetch_timestamp') != token_cache.get(token_key, {}).get('fetch_timestamp'):
                         logger.debug(f"Updating JSON token_cache for {token_key}.")
                         if token_key not in token_cache: token_cache[token_key] = {}
                         token_cache[token_key].update(new_data); data_changed_json = True
 
                     current_mcap = new_data.get('market_cap_usd')
-                    if current_mcap is None or current_mcap <= 0:
-                        logger.debug(f"Token {token_key} has invalid/zero MCAP ({current_mcap}). Skipping notification checks.")
-                        continue # Skip notification checks if MCAP is invalid
+                    if current_mcap is None or current_mcap <= 0: continue
 
                     if token_cache[token_key].get('first_mcap_usd') is None:
-                        logger.info(f"Recorded first MCAP for {token_key}: ${current_mcap:,.0f}")
+                        logger.info(f"Recorded first MCAP {token_key}: ${current_mcap:,.0f}")
                         token_cache[token_key]['first_mcap_usd'] = current_mcap
                         token_cache[token_key]['first_mcap_timestamp'] = now.isoformat(); data_changed_json = True
 
-                    # --- Pumping Notification Logic (using Redis state) ---
                     first_mcap = token_cache[token_key].get('first_mcap_usd')
                     min_mcap_pump = getattr(config, 'MIN_MCAP_FOR_PUMP_NOTIF', 0)
                     redis_state_key = f"market_state:{token_key}"
-                    state = {} # Initialize state dict for this token
+                    state = {} # Initialize/reset state for this token cycle
 
+                    # --- Pumping Logic ---
                     if first_mcap and first_mcap > 0 and current_mcap >= min_mcap_pump:
-                        # Read current state from Redis
                         try: state = await redis_client.hgetall(redis_state_key)
                         except Exception as e: logger.exception(f"Error reading Redis state for {token_key}: {e}"); state = {}
 
@@ -3067,24 +3042,27 @@ async def periodic_market_data_update():
                             last_notif_ts_str = state.get('last_pump_notif_ts'); can_notify = True
                             if last_notif_ts_str:
                                 try:
-                                    last_notif_dt = datetime.fromisoformat(last_notif_ts_str).replace(tzinfo=timezone.utc if datetime.fromisoformat(last_notif_ts_str).tzinfo is None else None)
+                                    last_notif_dt = datetime.fromisoformat(last_notif_ts_str)
+                                    # --- FIX: Ensure last_notif_dt is timezone-aware ---
+                                    if last_notif_dt.tzinfo is None:
+                                        last_notif_dt = last_notif_dt.replace(tzinfo=timezone.utc)
+                                    # --- End Fix ---
                                     if now < last_notif_dt + timedelta(minutes=config.PUMPING_NOTIF_COOLDOWN_MINUTES): can_notify = False; logger.info(f"Pump trigger {token_key} skipped: Cooldown.")
-                                except ValueError: pass
+                                except ValueError: logger.warning(f"Invalid pump timestamp '{last_notif_ts_str}' for {token_key}")
                             if can_notify:
                                 logger.info(f"SENDING PUMP notification {token_key}: {achieved_multiplier}x");
                                 await send_pumping_notification(token_key, achieved_multiplier, current_mcap, first_mcap);
                                 redis_state_updates['last_notified_multiplier'] = str(achieved_multiplier)
                                 redis_state_updates['last_pump_notif_ts'] = now.isoformat()
 
-                    # --- Leaderboard Entry Notification Logic (using Redis state) ---
+                    # --- Leaderboard Logic ---
                     trending_ranks = {key: rank+1 for rank, (key, _) in enumerate(get_trending_tokens(config.TRENDING_WINDOW_HOURS))}
                     current_rank = trending_ranks.get(token_key)
 
                     if current_rank and current_rank <= config.SCOREBOARD_TOP_N:
-                        # Read state again only if needed (not read during pumping check)
-                        if not state:
-                             try: state = await redis_client.hgetall(redis_state_key)
-                             except Exception as e: logger.exception(f"Error reading Redis state for {token_key}: {e}"); state = {}
+                        if not state: # Read state if not already read
+                            try: state = await redis_client.hgetall(redis_state_key)
+                            except Exception as e: logger.exception(f"Error reading Redis state for {token_key}: {e}"); state = {}
 
                         previous_rank_str = state.get('previous_vote_rank')
                         previous_rank = int(previous_rank_str) if previous_rank_str and previous_rank_str.isdigit() else None
@@ -3094,9 +3072,13 @@ async def periodic_market_data_update():
                             last_entry_ts_str = state.get('last_entry_notif_ts'); can_notify_entry = True
                             if last_entry_ts_str:
                                 try:
-                                    last_entry_dt = datetime.fromisoformat(last_entry_ts_str).replace(tzinfo=timezone.utc if datetime.fromisoformat(last_entry_ts_str).tzinfo is None else None)
+                                    last_entry_dt = datetime.fromisoformat(last_entry_ts_str)
+                                    # --- FIX: Ensure last_entry_dt is timezone-aware ---
+                                    if last_entry_dt.tzinfo is None:
+                                        last_entry_dt = last_entry_dt.replace(tzinfo=timezone.utc)
+                                    # --- End Fix ---
                                     if now < last_entry_dt + timedelta(minutes=config.LEADERBOARD_ENTRY_NOTIF_COOLDOWN_MINUTES): can_notify_entry = False; logger.info(f"Leaderboard entry {token_key} skipped: Cooldown.")
-                                except ValueError: pass
+                                except ValueError: logger.warning(f"Invalid entry timestamp '{last_entry_ts_str}' for {token_key}")
                             if can_notify_entry:
                                 logger.info(f"SENDING Leaderboard entry notification {token_key}: Rank {current_rank}");
                                 await send_leaderboard_entry_notification(token_key, current_rank, current_mcap);
@@ -3104,38 +3086,31 @@ async def periodic_market_data_update():
 
                         if previous_rank != current_rank:
                             redis_state_updates['previous_vote_rank'] = str(current_rank)
-
-                    # --- Handle Rank Drop / Ensure State Cleanup ---
-                    elif token_key in market_data_state: # Check old dict for cleanup (Temporary)
-                         if market_data_state[token_key].get('previous_vote_rank') is not None:
-                             logger.debug(f"Token {token_key} dropped off leaderboard. Clearing previous rank in old state dict.")
-                             market_data_state[token_key]['previous_vote_rank'] = None; data_changed_json = True # Mark JSON state changed
-                    # Check Redis state for rank drop as well
-                    try:
+                    # --- Rank Drop Logic ---
+                    else: # Not currently in top N
                         if not state: # Read state if not already read
-                             state = await redis_client.hgetall(redis_state_key)
+                            try: state = await redis_client.hgetall(redis_state_key)
+                            except Exception as e: logger.exception(f"Error reading Redis state for {token_key}: {e}"); state = {}
+                        # If previous rank existed in Redis state, remove it
                         if state.get('previous_vote_rank') is not None:
-                             logger.debug(f"Token {token_key} dropped off leaderboard. Deleting previous_vote_rank from Redis.")
-                             # Use HDEL to remove the field cleanly
-                             await redis_client.hdel(redis_state_key, 'previous_vote_rank')
-                             # No need to add to redis_state_updates if we just deleted it
-                    except Exception as e: logger.error(f"Error checking/clearing previous rank from Redis for {token_key}: {e}")
-
+                            logger.debug(f"Token {token_key} dropped off leaderboard. Deleting previous_vote_rank from Redis.")
+                            try:
+                                deleted_count = await redis_client.hdel(redis_state_key, 'previous_vote_rank')
+                                if deleted_count == 0: logger.warning(f"Tried to delete previous_vote_rank for {token_key} but field was not found.")
+                            except Exception as e: logger.error(f"Error deleting previous rank from Redis for {token_key}: {e}")
+                            # No need to add to redis_state_updates as we deleted
 
                     # --- Apply Redis State Updates ---
                     if redis_state_updates:
                         try:
                             await redis_client.hset(redis_state_key, mapping=redis_state_updates)
                             logger.debug(f"Updated Redis state for {token_key}: {redis_state_updates}")
-                        except Exception as e:
-                            logger.exception(f"Failed to update Redis state for {token_key}: {e}")
+                        except Exception as e: logger.exception(f"Failed to update Redis state for {token_key}: {e}")
 
                 # --- Delay Between API Calls ---
                 api_delay = getattr(config, 'MARKET_API_DELAY_SECONDS', 1.1)
                 await asyncio.sleep(api_delay)
             # --- End of Token Fetch Loop ---
-
-            logger.info("Finished fetching data for all tracked tokens in this cycle.")
 
             # --- Biggest Gainers Post Logic ---
             gainers_posted_this_cycle = False
@@ -3143,43 +3118,35 @@ async def periodic_market_data_update():
                 can_post_gainers = False
                 if getattr(config, 'ENABLE_BIGGEST_GAINERS_POST', False):
                     logger.debug("Checking gainers post timing.")
-                    interval_minutes = getattr(config, 'BIGGEST_GAINERS_POST_INTERVAL_MINUTES', 360) # Default 6 hours
-                    if last_gainers_post_time is None or now >= last_gainers_post_time + timedelta(minutes=interval_minutes):
-                         can_post_gainers = True
-                         logger.info("Conditions met for posting biggest gainers.")
-                    else: logger.debug("Skipping gainers post: Interval not yet passed.")
-                else: logger.debug("Biggest Gainers post feature disabled.")
+                    interval_minutes = getattr(config, 'BIGGEST_GAINERS_POST_INTERVAL_MINUTES', 360)
+                    if last_gainers_post_time is None or now >= last_gainers_post_time + timedelta(minutes=interval_minutes): can_post_gainers = True; logger.info("Gainers post interval met.")
+                    else: logger.debug("Gainers post interval not met.")
+                else: logger.debug("Gainers post disabled.")
 
                 if can_post_gainers:
                     try: await send_biggest_gainers_post(); gainers_posted_this_cycle = True
                     except Exception as gainer_err: logger.exception(f"Error sending gainers post: {gainer_err}")
-            else: logger.info("Skipping Gainers post due to rate limit hit.")
+            else: logger.info("Skipping Gainers post due to rate limit.")
 
             # --- Save JSON Data ---
-            # Only save if JSON-specific data changed AND gainers didn't already save it
             if data_changed_json and not gainers_posted_this_cycle:
-                logger.info("Saving JSON data (token_cache/market_state changes) after market cycle.")
-                await save_data()
+                logger.info("Saving JSON data (token_cache/etc) after market cycle.")
+                await save_data() # Saves remaining JSON files
             elif data_changed_json and gainers_posted_this_cycle:
-                logger.info("JSON data changed, but assuming send_biggest_gainers_post handled the save.")
+                logger.info("JSON data changed, but assuming send_biggest_gainers_post handled save.")
             elif not data_changed_json:
-                logger.debug("No JSON data changes detected in market cycle, skipping save.")
+                logger.debug("No JSON data changes in market cycle.")
 
             logger.info("Market data update cycle finished.")
 
-        # --- ERROR HANDLING FOR THE ENTIRE CYCLE ---
-        except Exception as e: # Catch errors in the main loop logic
+        except Exception as e:
             logger.exception(f"CRITICAL error in periodic_market_data_update main loop: {e}")
-            # Reset interval temporarily to avoid spamming errors if loop fails instantly
-            update_interval_seconds = 120 # Wait 2 minutes before full retry
+            update_interval_seconds = 120
             logger.error(f"Pausing market data task for {update_interval_seconds}s due to loop error.")
 
-        # --- FINALLY BLOCK - ALWAYS SLEEP ---
         finally:
-            # This ensures the loop waits even if an error occurs before the normal sleep
             logger.debug(f"Market data task sleeping for {update_interval_seconds} seconds.")
             await asyncio.sleep(update_interval_seconds)
-
 
 # bot.py
 
@@ -3191,47 +3158,53 @@ async def process_minigame(message: Message, emoji: str):
          return
 
     user = message.from_user; chat_id = message.chat.id;
-    chat_id_str = str(chat_id); user_id_str = str(user.id);
+    chat_id_str = str(chat_id); user_id_str = str(user.id); # Create user_id_str here
     user_name = user.username if user.username else user.first_name
+
+    logger.info(f"User {user.id} ({user_name}) initiated minigame ({emoji}) in chat {chat_id}")
 
     # 1. Check if group is configured
     group_data = group_configs.get(chat_id_str)
     if not group_data or not group_data.get("config", {}).get("setup_complete") or not group_data.get("config", {}).get("is_active"):
-        await message.reply("Minigames can only be played in configured groups."); return
+        logger.warning(f"Minigame attempt in unconfigured/inactive group {chat_id_str} by user {user.id}")
+        await message.reply("Minigames can only be played in groups where the bot is fully configured and active."); return
 
     # 2. Get the token key for the reward
     token_key = group_data.get("token_key");
     if not token_key:
-        logger.error(f"Minigame failed in group {chat_id_str}: Missing token_key.");
-        await message.reply("Configuration error: Cannot determine token reward."); return
+        logger.error(f"Minigame attempt in configured group {chat_id_str} failed: Missing token_key in config.");
+        await message.reply("Configuration error: Cannot determine which token reward to give. Please contact an admin."); return
 
     # 3. Check minigame cooldown using Redis TTL
-    logger.debug(f"Checking Redis minigame cooldown for user {user.id_str}")
+    # --- FIX: Use user_id_str in the log message ---
+    logger.debug(f"Checking Redis minigame cooldown for user {user_id_str}")
     cooldown = await get_minigame_cooldown_remaining(user.id) # Use the refactored helper
     if cooldown:
-        await message.reply(f"⏳ Easy there! You can play again in <b>{format_timedelta(cooldown)}</b>."); return
+        await message.reply(f"⏳ Easy there! You can play the minigame again in <b>{format_timedelta(cooldown)}</b>."); return
 
     # 4. Send the dice
     try:
+        logger.debug(f"Sending dice {emoji} to chat {chat_id} for user {user.id}")
         sent_dice_msg = await bot.send_dice(chat_id=chat_id, emoji=emoji, reply_to_message_id=message.message_id);
         dice_value = sent_dice_msg.dice.value
         logger.info(f"User {user.id} rolled {emoji} in chat {chat_id}, result: {dice_value}")
     except Exception as e:
-        logger.exception(f"Failed to send dice emoji {emoji} for user {user.id}: {e}");
-        await message.reply(f"Oops! Couldn't roll the {emoji}."); return
+        logger.exception(f"Failed to send dice emoji {emoji} for user {user.id} in chat {chat_id}: {e}");
+        await message.reply(f"Oops! Something went wrong trying to roll the {emoji}. Please try again later."); return
 
     # 5. Determine win condition
     win_value = config.MINIGAME_WIN_VALUES.get(emoji);
     if win_value is None:
-        logger.error(f"Minigame config error: No win value for {emoji}");
+        logger.error(f"Minigame configuration error: No win value for {emoji}");
         await message.reply("Internal configuration error."); return
 
     is_win = (dice_value == win_value);
     reward_message = ""
+    data_changed = False # Flag if save needed
 
     # 6. Handle Win/Loss and Update Redis
-    redis_tasks = [] # List to run Redis operations concurrently
-    now = datetime.now(timezone.utc) # Get current time once
+    redis_tasks = []
+    now = datetime.now(timezone.utc)
 
     # Always set the cooldown with expiration
     cooldown_seconds = int(timedelta(hours=config.MINIGAME_COOLDOWN_HOURS).total_seconds())
@@ -3242,26 +3215,29 @@ async def process_minigame(message: Message, emoji: str):
     logger.debug(f"Setting Redis minigame cooldown for {user_id_str} with TTL {cooldown_seconds}s")
 
     if is_win:
-        logger.info(f"User {user.id} WON minigame ({emoji})!")
+        logger.info(f"User {user.id} WON the minigame ({emoji})!")
         try: token_display = await get_token_display_info(token_key);
         except: token_display = f"Token ({token_key[:6]}...)"
         win_desc = "Strike! 🎳" if emoji == "🎳" else "Bullseye! 🎯";
         reward_message = f"\n🎉 <b>{win_desc}</b> Congratulations, {user_name}! You won <b>{config.FREE_VOTE_REWARD_COUNT}</b> free vote(s) for {token_display}!";
 
-        # Increment free vote count atomically in Redis
         if config.FREE_VOTE_REWARD_COUNT > 0:
             redis_key_free = f"free_votes:{user_id_str}"
             redis_tasks.append(
                 redis_client.hincrby(redis_key_free, token_key, config.FREE_VOTE_REWARD_COUNT)
             )
             logger.info(f"Incrementing free votes for {user_id_str}/{token_key} by {config.FREE_VOTE_REWARD_COUNT}")
+            data_changed = True # Free votes changed
 
     else:
-        logger.info(f"User {user.id} lost minigame ({emoji}).")
+        logger.info(f"User {user.id} lost the minigame ({emoji}).")
         lose_desc = "Close!"
         if emoji == "🎳": lose_desc = "Gutter ball!" if dice_value == 1 else "So close!"
         elif emoji == "🎯": lose_desc = "Missed!" if dice_value == 1 else "Almost!"
         reward_message = f"\n😅 {lose_desc} Nice try, {user_name}! No win this time."
+
+    # Always setting cooldown changes state implicitly
+    data_changed = True
 
     # Execute Redis operations
     try:
@@ -3269,7 +3245,6 @@ async def process_minigame(message: Message, emoji: str):
         logger.debug(f"Executed {len(redis_tasks)} Redis operations for minigame result.")
     except Exception as redis_e:
          logger.exception(f"Error updating Redis after minigame for user {user.id}: {redis_e}")
-         # Inform user, but cooldown might already be set
          await message.reply("An error occurred saving the game result. Please contact support if issues persist.")
          return
 
