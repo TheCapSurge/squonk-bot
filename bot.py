@@ -7,6 +7,8 @@ import typing
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
+import redis.asyncio as redis
+
 import aiofiles
 import aiohttp # For making HTTP requests
 from aiogram import Bot, Dispatcher, F, Router, types
@@ -73,26 +75,27 @@ dp = Dispatcher(storage=storage)
 router = Router()
 http_session: typing.Optional[aiohttp.ClientSession] = None
 
+redis_client: typing.Optional[redis.Redis] = None
+
 # --- Data Persistence --- (Keep as is)
 async def load_data():
-    global group_configs, token_cache, user_votes, votes_log, pinned_messages, minigame_cooldowns, user_free_votes, market_data_state, last_gainers_post_time
+    global group_configs, token_cache, votes_log, pinned_messages, market_data_state, last_gainers_post_time
     os.makedirs(config.DATA_DIR, exist_ok=True)
     data_files = [
         (config.GROUP_CONFIG_FILE, "group_configs", {}),
         (config.TOKEN_CACHE_FILE, "token_cache", {}),
-        (config.USER_VOTES_FILE, "user_votes", {}),
         (config.VOTES_LOG_FILE, "votes_log", []),
         (config.PINNED_SCOREBOARD_DATA_FILE, "pinned_messages", {}),
-        (config.MINIGAME_COOLDOWNS_FILE, "minigame_cooldowns", {}),
-        (config.USER_FREE_VOTES_FILE, "user_free_votes", {}),
         (config.MARKET_DATA_STATE_FILE, "market_data_state", {}), # Load market state
     ]
+
+    logger.info("Loading data structures from JSON...")
     for path, var_name, default_value in data_files:
         default_type = type(default_value)
         try:
             async with aiofiles.open(path, mode='r', encoding='utf-8') as f:
                 content = await f.read()
-                if not content: # Handle empty file case
+                if not content:
                     logger.warning(f"Data file {path} is empty. Starting with default {default_type.__name__}.")
                     globals()[var_name] = default_value
                     continue
@@ -100,7 +103,6 @@ async def load_data():
 
                 if isinstance(data, default_type):
                     globals()[var_name] = data
-                    # Log length for lists/dicts, just 'dict' for dicts
                     data_size = len(data) if hasattr(data, '__len__') else 'dict'
                     logger.info(f"Loaded data from {path} ({data_size} items)")
                 else:
@@ -135,6 +137,8 @@ async def load_data():
              logger.exception(f"Error processing stored last_gainers_post_iso: {e}")
              last_gainers_post_time = None
 
+    logger.info("Data loading complete.")
+
 async def save_single_file(path: str, data_structure: typing.Any):
     """Atomically saves a single data structure to a JSON file."""
     temp_path = f"{path}.tmp"
@@ -157,7 +161,7 @@ async def save_single_file(path: str, data_structure: typing.Any):
         raise
 
 async def save_data():
-    global group_configs, token_cache, user_votes, votes_log, pinned_messages, minigame_cooldowns, user_free_votes, market_data_state, last_gainers_post_time
+    global group_configs, token_cache, votes_log, pinned_messages, market_data_state, last_gainers_post_time
     os.makedirs(config.DATA_DIR, exist_ok=True)
 
     # Save last gainers post time into market_data_state
@@ -178,30 +182,25 @@ async def save_data():
     data_to_save = {
         config.GROUP_CONFIG_FILE: group_configs,
         config.TOKEN_CACHE_FILE: token_cache,
-        config.USER_VOTES_FILE: user_votes,
         config.VOTES_LOG_FILE: votes_log,
         config.PINNED_SCOREBOARD_DATA_FILE: pinned_messages,
-        config.MINIGAME_COOLDOWNS_FILE: minigame_cooldowns,
-        config.USER_FREE_VOTES_FILE: user_free_votes,
         config.MARKET_DATA_STATE_FILE: market_data_state,
     }
-    logger.debug(f"Preparing to save data for {len(data_to_save)} files.")
+    logger.debug(f"Preparing to save data for {len(data_to_save)} JSON files.")
     save_tasks = []
     for path, data_structure in data_to_save.items():
-        # Launch each save operation concurrently
         save_tasks.append(asyncio.create_task(save_single_file(path, data_structure), name=f"SaveTask_{os.path.basename(path)}"))
 
-    # Wait for all save operations to complete
     results = await asyncio.gather(*save_tasks, return_exceptions=True)
     for i, result in enumerate(results):
-        if i < len(save_tasks): # Ensure index is valid
+        if i < len(save_tasks):
             task_name = save_tasks[i].get_name()
-            if isinstance(result, Exception):
-                logger.error(f"Error in background save task '{task_name}': {result}")
-            else:
-                logger.debug(f"Background save task '{task_name}' completed successfully.")
-        else:
-             logger.error(f"Result index {i} out of bounds for save tasks (length {len(save_tasks)})")
+            if isinstance(result, Exception): logger.error(f"Error in background JSON save task '{task_name}': {result}")
+            else: logger.debug(f"Background JSON save task '{task_name}' completed.")
+        else: logger.error(f"Result index {i} out of bounds for JSON save tasks")
+
+    logger.debug("JSON data saving finished.")
+
 
 
 async def periodic_save():
@@ -299,52 +298,53 @@ async def check_main_membership(user_id: int) -> typing.Tuple[bool, bool]:
     logger.info(f"Membership check result for user {user_id}: In Channel={in_channel}, In Group={in_group}")
     return in_channel, in_group
 
-def get_cooldown_remaining(user_id: int, token_key: str) -> typing.Optional[timedelta]:
-    """Calculates remaining REGULAR vote cooldown time for a user and token. Cleans up expired entries."""
-    user_id_str = str(user_id)
-    user_token_votes = user_votes.get(user_id_str, {})
+# bot.py
 
-    if token_key in user_token_votes:
-        try:
-            last_vote_time_str = user_token_votes[token_key]
+async def get_cooldown_remaining(user_id: int, token_key: str) -> typing.Optional[timedelta]:
+    """Calculates remaining REGULAR vote cooldown time using Redis. Cleans up expired entries."""
+    if not redis_client:
+         logger.error("Redis client not available in get_cooldown_remaining")
+         return None # Cannot check cooldown without Redis
+
+    user_id_str = str(user_id)
+    redis_key = f"user_votes:{user_id_str}"
+    logger.debug(f"Checking Redis cooldown for {redis_key}, field {token_key}")
+
+    try:
+        last_vote_time_str = await redis_client.hget(redis_key, token_key)
+
+        if last_vote_time_str:
             last_vote_time = datetime.fromisoformat(last_vote_time_str)
-            # Ensure timezone aware comparison
             if last_vote_time.tzinfo is None:
-                 last_vote_time = last_vote_time.replace(tzinfo=timezone.utc) # Assume UTC
+                last_vote_time = last_vote_time.replace(tzinfo=timezone.utc) # Assume UTC
 
             cooldown_end = last_vote_time + timedelta(hours=config.VOTE_COOLDOWN_HOURS)
-            now = datetime.now(timezone.utc) # Use timezone aware now
+            now = datetime.now(timezone.utc)
 
             if now < cooldown_end:
-                 remaining = cooldown_end - now
-                 logger.debug(f"Cooldown check for user {user_id_str}, token {token_key}: Remaining {remaining}")
-                 return remaining
+                remaining = cooldown_end - now
+                logger.debug(f"Cooldown check for user {user_id_str}, token {token_key}: Remaining {remaining}")
+                return remaining
             else:
-                 # Cooldown has expired, clean up the entry
-                 logger.debug(f"Cooldown expired for user {user_id_str}, token {token_key}. Cleaning up.")
-                 # Use try-except for deletion safety in case of race conditions
-                 try:
-                     del user_votes[user_id_str][token_key]
-                     if not user_votes[user_id_str]: # Remove user dict if empty
-                         del user_votes[user_id_str]
-                 except KeyError:
-                      logger.warning(f"KeyError during cooldown cleanup for {user_id_str}/{token_key}. Already removed?")
-                 # Defer saving to the caller or periodic save
-                 return None
-        except ValueError:
-             logger.error(f"Invalid timestamp format for user {user_id_str}, token {token_key}: '{user_token_votes[token_key]}'. Removing entry.")
-             # Clean up invalid entry
-             try:
-                 del user_votes[user_id_str][token_key]
-                 if not user_votes[user_id_str]: del user_votes[user_id_str]
-             except KeyError: pass
-             return None
-        except Exception as e:
-            logger.exception(f"Error calculating cooldown for user {user_id_str}, token {token_key}: {e}")
-            return None # Treat error as cooldown finished to avoid blocking user
-    else:
-        logger.debug(f"No cooldown entry found for user {user_id_str}, token {token_key}")
-        return None # No cooldown entry found
+                # Cooldown expired, clean up in Redis
+                logger.debug(f"Cooldown expired for user {user_id_str}, token {token_key}. Cleaning up Redis.")
+                await redis_client.hdel(redis_key, token_key)
+                # Check if hash is empty, maybe delete key? (Optional cleanup)
+                # if not await redis_client.hlen(redis_key):
+                #    await redis_client.delete(redis_key)
+                return None
+        else:
+            # Field doesn't exist in hash -> no cooldown
+            logger.debug(f"No cooldown entry found in Redis for user {user_id_str}, token {token_key}")
+            return None
+    except ValueError:
+         logger.error(f"Invalid timestamp format in Redis for user {user_id_str}, token {token_key}: '{last_vote_time_str}'. Removing entry.")
+         try: await redis_client.hdel(redis_key, token_key) # Clean up invalid entry
+         except Exception as del_e: logger.error(f"Failed to delete invalid cooldown entry: {del_e}")
+         return None
+    except Exception as e:
+        logger.exception(f"Error checking Redis cooldown for user {user_id_str}, token {token_key}: {e}")
+        return None # Treat error as cooldown finished
 
 def format_timedelta(delta: typing.Optional[timedelta]) -> str:
     """Formats timedelta into H hours M minutes S seconds."""
@@ -529,37 +529,31 @@ async def fetch_token_data_dexscreener(session: aiohttp.ClientSession, contract_
         logger.exception(f"Unexpected error fetching DexScreener data for {contract_address}: {e}")
         return None
 
-def get_minigame_cooldown_remaining(user_id: int) -> typing.Optional[timedelta]:
-    """Calculates remaining global minigame cooldown time for a user. Cleans up expired."""
-    user_id_str = str(user_id)
-    if user_id_str in minigame_cooldowns:
-        try:
-            last_play_time_str = minigame_cooldowns[user_id_str];
-            last_play_time = datetime.fromisoformat(last_play_time_str)
-            if last_play_time.tzinfo is None: last_play_time = last_play_time.replace(tzinfo=timezone.utc) # Assume UTC
-            cooldown_end = last_play_time + timedelta(hours=config.MINIGAME_COOLDOWN_HOURS);
-            now = datetime.now(timezone.utc)
-            if now < cooldown_end:
-                return cooldown_end - now
-            else:
-                 # Cooldown expired, clean up
-                 logger.debug(f"Minigame cooldown expired for user {user_id_str}. Cleaning up.")
-                 try:
-                     del minigame_cooldowns[user_id_str]
-                 except KeyError: pass # Already gone
-                 # Defer save
-                 return None
-        except ValueError:
-             logger.error(f"Invalid minigame cooldown timestamp format for user {user_id_str}: '{minigame_cooldowns[user_id_str]}'. Removing entry.");
-             try:
-                 del minigame_cooldowns[user_id_str] # Clean up invalid entry
-             except KeyError: pass
-             return None
-        except Exception as e:
-             logger.exception(f"Error calculating minigame cooldown for user {user_id_str}: {e}")
-             return None # Treat error as cooldown finished
-    return None # No cooldown entry found
+# bot.py
 
+async def get_minigame_cooldown_remaining(user_id: int) -> typing.Optional[timedelta]:
+    """Calculates remaining global minigame cooldown time using Redis TTL."""
+    if not redis_client:
+         logger.error("Redis client not available in get_minigame_cooldown_remaining")
+         return None
+
+    user_id_str = str(user_id)
+    redis_key = f"minigame_cd:{user_id_str}"
+    logger.debug(f"Checking Redis minigame cooldown TTL for {redis_key}")
+
+    try:
+        ttl_seconds = await redis_client.ttl(redis_key)
+        # TTL returns -2 if key doesn't exist, -1 if no expiry
+        if ttl_seconds >= 0:
+            logger.debug(f"Minigame cooldown for {user_id_str}: Remaining {ttl_seconds}s")
+            return timedelta(seconds=ttl_seconds)
+        else:
+            logger.debug(f"No active minigame cooldown found in Redis for {user_id_str} (TTL: {ttl_seconds})")
+            return None # No cooldown active or key doesn't exist
+    except Exception as e:
+        logger.exception(f"Error checking Redis minigame cooldown TTL for user {user_id_str}: {e}")
+        return None # Treat error as cooldown finished
+    
 async def generate_scoreboard_text(include_market_data=False) -> str:
     """Generates the formatted text for the pinned scoreboard message."""
     logger.debug("Generating scoreboard text...")
@@ -1578,116 +1572,131 @@ async def cancel_setup(callback: CallbackQuery, state: FSMContext):
 # --- <<< MODIFIED VOTING FLOW >>> ---
 
 # --- Modify process_vote_action to return markup on failure ---
+# bot.py
+
 async def process_vote_action(user_id: int, user_name: str, token_key: str) -> typing.Tuple[str, bool, typing.Optional[InlineKeyboardMarkup]]:
     """
-    Handles the core logic of processing a vote attempt.
-    Checks membership, cooldowns, free votes, logs vote, saves data.
+    Handles the core logic of processing a vote attempt using Redis.
     Returns a tuple: (result_message: str, vote_succeeded: bool, join_markup: Optional[InlineKeyboardMarkup]).
     """
+    if not redis_client:
+         logger.error("Redis client not available in process_vote_action")
+         return ("Internal error: Cannot process vote at this time.", False, None)
+
     user_id_str = str(user_id);
     safe_user_name = user_name.replace('<', '<').replace('>', '>');
-    logger.info(f"Processing vote action logic for user {user_id} ({safe_user_name}), token {token_key}")
-    try:
-        token_display = await get_token_display_info(token_key)
-    except Exception as e:
-        logger.error(f"Failed to get token display info for {token_key} during vote logic: {e}")
-        token_display = f"Token ({token_key[:6]}...)" # Fallback display
+    logger.info(f"Processing vote action logic (Redis) for user {user_id} ({safe_user_name}), token {token_key}")
+    try: token_display = await get_token_display_info(token_key)
+    except Exception as e: logger.error(f"Failed to get token display info for {token_key}: {e}"); token_display = f"Token {token_key[:6]}..."
 
-    # 1. Check Main Channel/Group Membership
+    # 1. Check Membership (Remains the same)
     logger.debug(f"Checking main channel/group membership for user {user_id}")
     in_channel, in_group = await check_main_membership(user_id)
     if not in_channel or not in_group:
-        join_markup_builder = InlineKeyboardBuilder();
-        bot_info = await bot.get_me()
-
+        join_markup_builder = InlineKeyboardBuilder(); bot_info = await bot.get_me()
         async def add_join_button_vote(chat_id_config: typing.Union[int, str], text: str, chat_name_log: str):
-            """Inner helper to add join buttons"""
             url = None;
-            if not chat_id_config: logger.debug(f"Join button {text} skipped: ID not configured."); return
+            if not chat_id_config: return
             try:
                 chat_id_for_link = None; invite_link_chat_id = None
                 if isinstance(chat_id_config, str) and chat_id_config.startswith("@"): url = f"https://t.me/{chat_id_config.lstrip('@')}"; chat_id_for_link = chat_id_config
                 elif isinstance(chat_id_config, int): chat_id_for_link = chat_id_config; invite_link_chat_id = chat_id_config
                 elif isinstance(chat_id_config, str) and chat_id_config.lstrip('-').isdigit(): numeric_id = int(chat_id_config); chat_id_for_link = numeric_id; invite_link_chat_id = numeric_id
                 else: logger.error(f"Invalid chat ID format {chat_id_config} for {text} button in vote check."); return
-
                 if invite_link_chat_id and not url:
-                    logger.debug(f"Attempting invite link creation for {chat_name_log} ({invite_link_chat_id})")
                     try: link = await bot.create_chat_invite_link(invite_link_chat_id, member_limit=1); url = link.invite_link
-                    except Exception as e: logger.warning(f"Could not create invite link for {chat_name_log} ({invite_link_chat_id}) in vote check: {e}. Using fallback."); url = f"https://t.me/{bot_info.username}?start=request_join_{chat_id_for_link}"
-
-                if url: join_markup_builder.button(text=text, url=url); logger.debug(f"Added join button for {text}")
-                else: logger.warning(f"Could not generate URL for join button {text} ({chat_id_for_link}) in vote check")
+                    except Exception as e: logger.warning(f"Could not create invite link for {chat_name_log}: {e}. Using fallback."); url = f"https://t.me/{bot_info.username}?start=request_join_{chat_id_for_link}"
+                if url: join_markup_builder.button(text=text, url=url)
             except Exception as e: logger.error(f"Error creating vote check join button for {chat_id_config}: {e}")
-
         missing_reqs = []
         if not in_channel: missing_reqs.append("main channel"); await add_join_button_vote(config.MAIN_CHANNEL_ID, "➡️ Join Main Channel", "Main Channel")
         if not in_group: missing_reqs.append("main group"); await add_join_button_vote(config.MAIN_GROUP_ID, "➡️ Join Main Group", "Main Group")
-
-        join_markup_builder.adjust(1);
-        final_markup = join_markup_builder.as_markup() if join_markup_builder.buttons else None
+        join_markup_builder.adjust(1); final_markup = join_markup_builder.as_markup() if join_markup_builder.buttons else None
         reason = ' and '.join(missing_reqs)
         logger.warning(f"Vote logic failed for user {user_id}: Not member of {reason}.")
-        # --- Return failure message, False status, and the markup ---
         return (f"⚠️ Vote Failed! You must be a member of the {reason} to vote.\nPlease join using the button(s) below and try voting again.", False, final_markup)
 
-    # --- (Rest of the function: cooldown check, free vote check, logging, saving - remains the same) ---
+    # 2. Check Free Votes using Redis
     used_free_vote = False
-    data_changed = False # Flag if save is needed
-    logger.debug(f"Checking free votes for user {user_id_str}, token {token_key}")
-    if user_id_str in user_free_votes and token_key in user_free_votes[user_id_str] and user_free_votes[user_id_str][token_key] > 0:
-        user_free_votes[user_id_str][token_key] -= 1;
-        remaining_free = user_free_votes[user_id_str][token_key];
-        used_free_vote = True;
-        data_changed = True
-        logger.info(f"User {user_id} used a free vote for {token_key}. Remaining free for this token: {remaining_free}")
-        if user_free_votes[user_id_str][token_key] <= 0: del user_free_votes[user_id_str][token_key];
-        if not user_free_votes[user_id_str]: del user_free_votes[user_id_str];
-    else:
-        logger.debug(f"No free votes found/used for {user_id_str}/{token_key}. Checking regular cooldown.")
-        cooldown = get_cooldown_remaining(user_id, token_key)
-        if cooldown:
-            logger.info(f"Vote logic denied for user {user_id} on {token_key} due to active cooldown: {format_timedelta(cooldown)} remaining.")
-            return (f"⏳ Cooldown active! You recently voted for {token_display}.\nTry again in <b>{format_timedelta(cooldown)}</b>.", False, None) # No markup on cooldown
+    remaining_free = 0
+    redis_key_free = f"free_votes:{user_id_str}"
+    try:
+        current_free_str = await redis_client.hget(redis_key_free, token_key)
+        if current_free_str and int(current_free_str) > 0:
+            # Atomically decrement and get new value
+            new_count = await redis_client.hincrby(redis_key_free, token_key, -1)
+            used_free_vote = True
+            remaining_free = new_count
+            logger.info(f"User {user_id} used Redis free vote for {token_key}. Remaining: {remaining_free}")
+            # Clean up field if count reaches zero
+            if new_count <= 0:
+                logger.debug(f"Cleaning up zero free votes in Redis for {user_id_str}/{token_key}")
+                await redis_client.hdel(redis_key_free, token_key)
+                # Optional: Delete the whole hash key if empty?
+                # if not await redis_client.hlen(redis_key_free):
+                #    await redis_client.delete(redis_key_free)
         else:
-             logger.debug(f"No active cooldown for user {user_id}, token {token_key}. Proceeding with regular vote.")
-             if user_id_str in user_votes and token_key not in user_votes.get(user_id_str, {}):
-                 data_changed = True # Cooldown was cleaned up
+            logger.debug(f"No free votes in Redis for {user_id_str}/{token_key}. Checking cooldown.")
+            # 3. Check Regular Cooldown (only if no free vote was used)
+            cooldown = await get_cooldown_remaining(user_id, token_key) # Uses Redis helper
+            if cooldown:
+                logger.info(f"Vote logic denied for user {user_id} on {token_key} due to active Redis cooldown: {format_timedelta(cooldown)} remaining.")
+                return (f"⏳ Cooldown active! You recently voted for {token_display}.\nTry again in <b>{format_timedelta(cooldown)}</b>.", False, None)
+            else:
+                 logger.debug(f"No active cooldown in Redis for user {user_id}, token {token_key}.")
 
+    except ValueError: # Error converting free vote count from Redis string
+         logger.error(f"Invalid free vote count '{current_free_str}' found in Redis for {user_id}/{token_key}. Treating as 0.")
+         await redis_client.hdel(redis_key_free, token_key) # Clean up bad value
+         # Now check regular cooldown as free vote failed
+         cooldown = await get_cooldown_remaining(user_id, token_key)
+         if cooldown: return (f"⏳ Cooldown active! Try again in <b>{format_timedelta(cooldown)}</b>.", False, None)
+    except Exception as e:
+         logger.exception(f"Error checking/using free votes in Redis for {user_id}/{token_key}: {e}")
+         # Fallback to checking regular cooldown
+         cooldown = await get_cooldown_remaining(user_id, token_key)
+         if cooldown: return (f"⏳ Cooldown active! Try again in <b>{format_timedelta(cooldown)}</b>.", False, None)
+
+    # 4. Record Vote / Set Cooldown in Redis
     now = datetime.now(timezone.utc); now_iso = now.isoformat()
+    redis_tasks = [] # For vote log + potential cooldown set
+
+    # Log the vote
+    log_entry = {"user_id": user_id, "user_name": user_name, "contract_chain": token_key, "timestamp": now_iso, "is_free_vote": used_free_vote};
+    votes_log.append(log_entry) # Keep votes_log in memory/JSON for now
+    redis_tasks.append(save_data()) # Schedule save for votes_log and other JSON data
+
+    # Set regular vote cooldown in Redis *only* if it wasn't a free vote
     if not used_free_vote:
-        if user_id_str not in user_votes: user_votes[user_id_str] = {};
-        user_votes[user_id_str][token_key] = now_iso
-        logger.info(f"Recorded regular vote for user {user_id}, token {token_key}. Cooldown started.")
-        data_changed = True
-    else:
-        logger.info(f"Recording free vote for user {user_id}, token {token_key}.")
+        redis_key_cooldown = f"user_votes:{user_id_str}"
+        redis_tasks.append(
+            redis_client.hset(redis_key_cooldown, token_key, now_iso)
+        )
+        logger.info(f"Setting Redis regular vote cooldown for user {user_id}, token {token_key}.")
 
-    log_entry = { "user_id": user_id, "user_name": user_name, "contract_chain": token_key, "timestamp": now_iso, "is_free_vote": used_free_vote };
-    votes_log.append(log_entry)
-    data_changed = True
-    logger.debug(f"Appended vote log entry: {log_entry}")
+    # Run Redis operations + JSON save concurrently
+    try:
+        await asyncio.gather(*redis_tasks)
+        logger.debug("Successfully logged vote and updated Redis/JSON state.")
+    except Exception as e:
+         logger.exception(f"Error during concurrent Redis/JSON update for vote action {user_id}/{token_key}: {e}")
+         # Vote might be logged but cooldown/free vote update might fail
+         return ("An error occurred while saving vote data. Please try again.", False, None)
 
-    if data_changed:
-        logger.debug("Data changed, saving vote action state.")
-        await save_data()
-    else:
-         logger.debug("No data changes detected after vote processing.")
-
+    # 5. Send Group Notifications (Remains same)
     await send_vote_notification_to_groups(user_id, safe_user_name, token_key, used_free_vote, token_display)
 
+    # 6. Format Success Message
     success_message = f"✅ Vote cast successfully for <b>{token_display}</b>!\n\n"
     if used_free_vote:
-        remaining_free = user_free_votes.get(user_id_str, {}).get(token_key, 0);
+        # Use the 'remaining_free' calculated earlier
         success_message = f"✅ Free vote used for <b>{token_display}</b>!\n"
         success_message += f"You have {remaining_free} free vote(s) left for this token.\n\n"
         success_message += f"Your regular vote cooldown for {token_display} is unaffected."
-        logger.info(f"Vote success message (free vote) generated for user {user_id}")
     else:
         success_message += f"You can cast your next regular vote for this token in {config.VOTE_COOLDOWN_HOURS} hours."
-        logger.info(f"Vote success message (regular vote) generated for user {user_id}")
 
-    return (success_message, True, None) # <<< Return success message, True status, and None for markup
+    return (success_message, True, None) # Return success message, True status, no markup
 
 
 async def send_vote_notification_to_groups(user_id: int, safe_user_name: str, token_key: str, used_free_vote: bool, token_display: str):
@@ -2049,13 +2058,27 @@ async def handle_mycooldowns(message: Message):
 
     await message.reply("\n".join(reply_lines))
 
+# bot.py
+
 @router.message(Command("myfreevotes"))
 async def handle_myfreevotes(message: Message):
-    """Shows the user's balance of free votes."""
+    """Shows the user's balance of free votes using Redis."""
+    if not redis_client:
+         logger.error("Redis client not available in handle_myfreevotes")
+         await message.reply("Internal error: Cannot fetch free vote data.")
+         return
+
     user_id = message.from_user.id; user_id_str = str(user_id);
     logger.info(f"User {user_id} requested /myfreevotes")
-    free_vote_data = user_free_votes.get(user_id_str, {})
-    needs_save = False # Flag for cleanup
+    redis_key = f"free_votes:{user_id_str}"
+
+    try:
+        # Get all token keys and counts from the user's hash
+        free_vote_data = await redis_client.hgetall(redis_key)
+    except Exception as e:
+         logger.exception(f"Error fetching free votes from Redis for user {user_id}: {e}")
+         await message.reply("An error occurred fetching your free vote balance.")
+         return
 
     if not free_vote_data:
         await message.reply(f"You currently have no free votes. Play /bowl or /darts in a configured group for a chance to win {config.FREE_VOTE_REWARD_COUNT}!"); return
@@ -2064,40 +2087,25 @@ async def handle_myfreevotes(message: Message):
     total_free_votes = 0;
     active_token_votes = [] # Store tuples of (display_name, count)
 
-    # Iterate safely and clean up zero counts
-    for token_key, count in list(free_vote_data.items()):
-        if count is None or count <= 0:
-            logger.debug(f"Cleaning up zero/invalid count free vote entry for user {user_id}, token {token_key}")
-            try:
-                 del user_free_votes[user_id_str][token_key]
-                 needs_save = True
-            except KeyError: pass # Already gone
-            continue # Skip to next token
-
-        # Valid count > 0
+    for token_key, count_str in free_vote_data.items():
         try:
+            count = int(count_str) # Counts are stored as strings in Redis hashes
+            if count <= 0:
+                # Clean up zero/negative counts if they somehow occur
+                logger.warning(f"Found zero/negative free vote count for {user_id}/{token_key}. Removing.")
+                await redis_client.hdel(redis_key, token_key)
+                continue
+
             token_display = await get_token_display_info(token_key);
             active_token_votes.append((token_display, count))
             total_free_votes += count
+        except ValueError:
+             logger.error(f"Invalid free vote count '{count_str}' found in Redis for {user_id}/{token_key}. Skipping.")
         except Exception as e:
-            logger.error(f"Error getting display info for token {token_key} in myfreevotes: {e}")
-            # Still count it, but use key as display fallback
-            active_token_votes.append((f"Token ({token_key})", count))
-            total_free_votes += count
+            logger.error(f"Error processing free vote entry for {user_id}/{token_key}: {e}")
 
-    # Check if user dict is now empty after cleanup
-    if user_id_str in user_free_votes and not user_free_votes[user_id_str]:
-         logger.debug(f"Removing empty free vote dict for user {user_id}.")
-         del user_free_votes[user_id_str]
-         needs_save = True
-
-    if needs_save:
-         logger.info("Saving free vote data after cleanup.")
-         await save_data()
-
-    # Construct reply based on remaining votes
-    if not active_token_votes: # If all entries were cleaned up or initially empty
-        await message.reply(f"You currently have no active free votes. Play /bowl or /darts in a configured group for a chance to win {config.FREE_VOTE_REWARD_COUNT}!"); return
+    if not active_token_votes: # If all entries were invalid or cleaned up
+        await message.reply(f"You currently have no active free votes. Play /bowl or /darts in a configured group!"); return
 
     # Sort alphabetically by token display name for consistent order
     active_token_votes.sort(key=lambda x: x[0])
@@ -2485,8 +2493,6 @@ async def handle_togglenotifications(message: Message):
 
     await message.reply(f"✅ Vote notifications for this group have been turned <b>{'ON' if new_status else 'OFF'}</b>.")
 
-# --- <<< INSERT THIS FUNCTION DEFINITION >>> ---
-# (Place it before send_pumping_notification, etc.)
 
 async def send_main_channel_notification(text: str, photo_url: typing.Optional[str] = None, reply_markup=None):
     """Helper to send notifications to configured main channel AND/OR group."""
@@ -2571,8 +2577,6 @@ async def send_main_channel_notification(text: str, photo_url: typing.Optional[s
          logger.debug("Main Group ID not configured or same as channel.")
 
     return sent_channel or sent_group # Return True if sent to at least one target successfully
-
-# --- <<< END OF INSERTED FUNCTION >>> ---
 
 
 async def send_pumping_notification(token_key: str, multiplier: int, current_mcap: float, first_mcap: float):
@@ -2826,7 +2830,6 @@ async def send_biggest_gainers_post():
     else:
         logger.error("Failed to send 'Biggest Gainers' post to any target channel/group.")
 
-# --- <<< END OF INSERTED FUNCTIONS >>> ---
 
 @router.message(Command("setvotethreshold"), F.chat.type.in_([ChatType.GROUP, ChatType.SUPERGROUP]))
 async def handle_setvotethreshold(message: Message):
@@ -2970,21 +2973,25 @@ async def periodic_scoreboard_update():
         await asyncio.sleep(update_interval_seconds)
 
 async def periodic_market_data_update():
-    """Background task to fetch market data and trigger notifications."""
-    global http_session, last_gainers_post_time
-    await asyncio.sleep(30); logger.info("Periodic market data fetcher task started.")
+    """Background task to fetch market data and trigger notifications using Redis for state."""
+    if not redis_client:
+        logger.error("Redis client not available at start of periodic_market_data_update. Task cannot run.")
+        return # Cannot run without Redis
+
+    global http_session, last_gainers_post_time # last_gainers_post_time still loaded from JSON state file initially
+    await asyncio.sleep(30); logger.info("Periodic market data fetcher task started (using Redis state).")
+
     while True:
-        # --- Outer Task Loop ---
         update_interval_seconds = config.MARKET_DATA_UPDATE_INTERVAL_MINUTES * 60
-        try:
+        try: # <<< START OF MAIN TRY BLOCK FOR THE CYCLE
             now = datetime.now(timezone.utc);
             rate_limit_hit = False;
-            data_changed = False # Flag to track if save_data() is needed this cycle
+            data_changed_json = False # Flag for saving JSON parts if needed
 
             tracked_token_keys = list(token_cache.keys()) # Get tokens to check
             if not tracked_token_keys:
-                logger.info("No tokens configured in token_cache, skipping market data fetch cycle.");
-                await asyncio.sleep(update_interval_seconds);
+                logger.info("No tokens configured, skipping market data fetch cycle.");
+                # await asyncio.sleep(update_interval_seconds); # Sleep moved to finally block
                 continue # Skip rest of the loop if no tokens
 
             logger.info(f"Starting market data fetch cycle for {len(tracked_token_keys)} tokens...")
@@ -3021,271 +3028,256 @@ async def periodic_market_data_update():
                 # --- Process Fetched Data ---
                 if new_data:
                     logger.debug(f"Successfully fetched data for {token_key}. Processing...")
-                    # Check if data actually changed compared to cache to minimize writes
-                    current_fetch_ts = new_data.get('fetch_timestamp')
-                    cached_fetch_ts = token_cache.get(token_key, {}).get('fetch_timestamp')
+                    redis_state_updates = {} # Collect Redis HSET updates for this token
 
-                    # Update cache only if new data or timestamp differs
-                    if token_key not in token_cache or current_fetch_ts != cached_fetch_ts:
-                        logger.debug(f"Updating token_cache for {token_key} as data is new or changed.")
+                    # Update token_cache (still JSON for now)
+                    if token_key not in token_cache or new_data.get('fetch_timestamp') != token_cache.get(token_key, {}).get('fetch_timestamp'):
+                        logger.debug(f"Updating JSON token_cache for {token_key}.")
                         if token_key not in token_cache: token_cache[token_key] = {}
-                        token_cache[token_key].update(new_data)
-                        data_changed = True # Mark cache updated
+                        token_cache[token_key].update(new_data); data_changed_json = True
 
-                    # --- Get MCAP for Notifications ---
                     current_mcap = new_data.get('market_cap_usd')
                     if current_mcap is None or current_mcap <= 0:
                         logger.debug(f"Token {token_key} has invalid/zero MCAP ({current_mcap}). Skipping notification checks.")
                         continue # Skip notification checks if MCAP is invalid
 
-                    # --- First MCAP Logic ---
                     if token_cache[token_key].get('first_mcap_usd') is None:
-                         logger.info(f"Recorded first MCAP for {token_key}: ${current_mcap:,.0f}")
-                         token_cache[token_key]['first_mcap_usd'] = current_mcap
-                         token_cache[token_key]['first_mcap_timestamp'] = now.isoformat()
-                         data_changed = True # Mark cache updated
+                        logger.info(f"Recorded first MCAP for {token_key}: ${current_mcap:,.0f}")
+                        token_cache[token_key]['first_mcap_usd'] = current_mcap
+                        token_cache[token_key]['first_mcap_timestamp'] = now.isoformat(); data_changed_json = True
 
-                    # --- Pumping Notification Logic ---
+                    # --- Pumping Notification Logic (using Redis state) ---
                     first_mcap = token_cache[token_key].get('first_mcap_usd')
-                    min_mcap_pump = config.MIN_MCAP_FOR_PUMP_NOTIF or 0
-                    if first_mcap and first_mcap > 0 and current_mcap >= min_mcap_pump:
-                        # Initialize state if needed
-                        if token_key not in market_data_state:
-                             logger.debug(f"Initializing market_data_state for {token_key}")
-                             market_data_state[token_key] = {}; data_changed = True
-                        state = market_data_state[token_key];
-                        last_multiplier = state.get('last_notified_multiplier', 0);
-                        # Avoid division by zero if first_mcap somehow becomes zero after check
-                        current_multiplier_raw = (current_mcap / first_mcap) if first_mcap > 0 else 0
-                        achieved_multiplier = 0
-                        # Find highest achieved multiplier threshold
-                        for threshold in sorted(config.PUMPING_MULTIPLIERS, reverse=True):
-                             if current_multiplier_raw >= threshold:
-                                 achieved_multiplier = threshold; break
-                        # Check if achieved multiplier is higher than last notified
-                        if achieved_multiplier > last_multiplier:
-                             logger.info(f"Potential pumping trigger for {token_key}: Achieved {achieved_multiplier}x (last notified: {last_multiplier}x)")
-                             # Check notification cooldown
-                             last_notif_ts_str = state.get('last_pump_notif_ts'); can_notify = True
-                             if last_notif_ts_str:
-                                 try:
-                                     last_notif_dt = datetime.fromisoformat(last_notif_ts_str);
-                                     if last_notif_dt.tzinfo is None: last_notif_dt = last_notif_dt.replace(tzinfo=timezone.utc)
-                                     cooldown_duration = timedelta(minutes=config.PUMPING_NOTIF_COOLDOWN_MINUTES)
-                                     if now < last_notif_dt + cooldown_duration:
-                                         can_notify = False
-                                         logger.info(f"Pumping trigger {token_key} ({achieved_multiplier}x) skipped due to cooldown (last: {last_notif_ts_str}).")
-                                 except ValueError: logger.warning(f"Invalid pump notification timestamp format in state for {token_key}: {last_notif_ts_str}")
-                             # Send notification if allowed
-                             if can_notify:
-                                 logger.info(f"PUMPING notification triggered for {token_key}: {achieved_multiplier}x MCAP reached.");
-                                 # --- FIX: Added await ---
-                                 await send_pumping_notification(token_key, achieved_multiplier, current_mcap, first_mcap);
-                                 # Update state after successful notification attempt
-                                 state['last_notified_multiplier'] = achieved_multiplier
-                                 state['last_pump_notif_ts'] = now.isoformat()
-                                 data_changed = True # Mark state changed
+                    min_mcap_pump = getattr(config, 'MIN_MCAP_FOR_PUMP_NOTIF', 0)
+                    redis_state_key = f"market_state:{token_key}"
+                    state = {} # Initialize state dict for this token
 
-                    # --- Leaderboard Entry Notification Logic ---
-                    trending_ranks = {key: rank+1 for rank, (key, _) in enumerate(get_trending_tokens(config.TRENDING_WINDOW_HOURS))};
-                    current_rank = trending_ranks.get(token_key) # Get current rank by votes
+                    if first_mcap and first_mcap > 0 and current_mcap >= min_mcap_pump:
+                        # Read current state from Redis
+                        try: state = await redis_client.hgetall(redis_state_key)
+                        except Exception as e: logger.exception(f"Error reading Redis state for {token_key}: {e}"); state = {}
+
+                        last_multiplier = float(state.get('last_notified_multiplier', 0))
+                        current_multiplier_raw = (current_mcap / first_mcap) if first_mcap > 0 else 0; achieved_multiplier = 0
+                        for threshold in sorted(config.PUMPING_MULTIPLIERS, reverse=True):
+                            if current_multiplier_raw >= threshold: achieved_multiplier = threshold; break
+
+                        if achieved_multiplier > last_multiplier:
+                            logger.info(f"Pumping trigger check {token_key}: {achieved_multiplier}x (last: {last_multiplier}x)")
+                            last_notif_ts_str = state.get('last_pump_notif_ts'); can_notify = True
+                            if last_notif_ts_str:
+                                try:
+                                    last_notif_dt = datetime.fromisoformat(last_notif_ts_str).replace(tzinfo=timezone.utc if datetime.fromisoformat(last_notif_ts_str).tzinfo is None else None)
+                                    if now < last_notif_dt + timedelta(minutes=config.PUMPING_NOTIF_COOLDOWN_MINUTES): can_notify = False; logger.info(f"Pump trigger {token_key} skipped: Cooldown.")
+                                except ValueError: pass
+                            if can_notify:
+                                logger.info(f"SENDING PUMP notification {token_key}: {achieved_multiplier}x");
+                                await send_pumping_notification(token_key, achieved_multiplier, current_mcap, first_mcap);
+                                redis_state_updates['last_notified_multiplier'] = str(achieved_multiplier)
+                                redis_state_updates['last_pump_notif_ts'] = now.isoformat()
+
+                    # --- Leaderboard Entry Notification Logic (using Redis state) ---
+                    trending_ranks = {key: rank+1 for rank, (key, _) in enumerate(get_trending_tokens(config.TRENDING_WINDOW_HOURS))}
+                    current_rank = trending_ranks.get(token_key)
 
                     if current_rank and current_rank <= config.SCOREBOARD_TOP_N:
-                        logger.debug(f"Token {token_key} is currently ranked #{current_rank} in trending.")
-                        # Initialize state if needed
-                        if token_key not in market_data_state:
-                             logger.debug(f"Initializing market_data_state for {token_key}")
-                             market_data_state[token_key] = {}; data_changed = True
-                        state = market_data_state[token_key];
-                        previous_rank = state.get('previous_vote_rank') # Check previous *vote* rank stored
-                        logger.debug(f"Previous stored rank for {token_key}: {previous_rank}")
+                        # Read state again only if needed (not read during pumping check)
+                        if not state:
+                             try: state = await redis_client.hgetall(redis_state_key)
+                             except Exception as e: logger.exception(f"Error reading Redis state for {token_key}: {e}"); state = {}
 
-                        # Trigger if previously unranked OR ranked outside the top N
+                        previous_rank_str = state.get('previous_vote_rank')
+                        previous_rank = int(previous_rank_str) if previous_rank_str and previous_rank_str.isdigit() else None
+
                         if previous_rank is None or previous_rank > config.SCOREBOARD_TOP_N:
-                            logger.info(f"Potential leaderboard entry trigger for {token_key}: Entered rank {current_rank} (previously {previous_rank})")
-                            # Check notification cooldown for entry
+                            logger.info(f"Leaderboard entry trigger {token_key}: Rank {current_rank} (prev: {previous_rank})")
                             last_entry_ts_str = state.get('last_entry_notif_ts'); can_notify_entry = True
                             if last_entry_ts_str:
                                 try:
-                                    last_entry_dt = datetime.fromisoformat(last_entry_ts_str);
-                                    if last_entry_dt.tzinfo is None: last_entry_dt = last_entry_dt.replace(tzinfo=timezone.utc)
-                                    entry_cooldown_duration = timedelta(minutes=config.LEADERBOARD_ENTRY_NOTIF_COOLDOWN_MINUTES)
-                                    if now < last_entry_dt + entry_cooldown_duration:
-                                        can_notify_entry = False
-                                        logger.info(f"Leaderboard entry trigger {token_key} (rank {current_rank}) skipped due to cooldown (last: {last_entry_ts_str}).")
-                                except ValueError: logger.warning(f"Invalid entry notification timestamp format in state for {token_key}: {last_entry_ts_str}")
-                            # Send notification if allowed
+                                    last_entry_dt = datetime.fromisoformat(last_entry_ts_str).replace(tzinfo=timezone.utc if datetime.fromisoformat(last_entry_ts_str).tzinfo is None else None)
+                                    if now < last_entry_dt + timedelta(minutes=config.LEADERBOARD_ENTRY_NOTIF_COOLDOWN_MINUTES): can_notify_entry = False; logger.info(f"Leaderboard entry {token_key} skipped: Cooldown.")
+                                except ValueError: pass
                             if can_notify_entry:
-                                 logger.info(f"LEADERBOARD ENTRY notification triggered for {token_key}: Entered at rank #{current_rank}.");
-                                 # --- FIX: Added await ---
-                                 await send_leaderboard_entry_notification(token_key, current_rank, current_mcap);
-                                 # Update state after successful notification attempt
-                                 state['last_entry_notif_ts'] = now.isoformat()
-                                 data_changed = True # Mark state changed
+                                logger.info(f"SENDING Leaderboard entry notification {token_key}: Rank {current_rank}");
+                                await send_leaderboard_entry_notification(token_key, current_rank, current_mcap);
+                                redis_state_updates['last_entry_notif_ts'] = now.isoformat()
 
-                        # Always update the stored previous rank if it has changed
-                        if state.get('previous_vote_rank') != current_rank:
-                            logger.debug(f"Updating previous rank for {token_key} from {state.get('previous_vote_rank')} to {current_rank}")
-                            state['previous_vote_rank'] = current_rank
-                            data_changed = True # Mark state changed
-                    else:
-                        # If currently NOT ranked in top N, clear the previous rank in state if it was set
-                        if token_key in market_data_state and market_data_state[token_key].get('previous_vote_rank') is not None:
-                             logger.debug(f"Token {token_key} dropped out of top {config.SCOREBOARD_TOP_N}. Clearing previous rank.")
-                             market_data_state[token_key]['previous_vote_rank'] = None
-                             data_changed = True # Mark state changed
+                        if previous_rank != current_rank:
+                            redis_state_updates['previous_vote_rank'] = str(current_rank)
+
+                    # --- Handle Rank Drop / Ensure State Cleanup ---
+                    elif token_key in market_data_state: # Check old dict for cleanup (Temporary)
+                         if market_data_state[token_key].get('previous_vote_rank') is not None:
+                             logger.debug(f"Token {token_key} dropped off leaderboard. Clearing previous rank in old state dict.")
+                             market_data_state[token_key]['previous_vote_rank'] = None; data_changed_json = True # Mark JSON state changed
+                    # Check Redis state for rank drop as well
+                    try:
+                        if not state: # Read state if not already read
+                             state = await redis_client.hgetall(redis_state_key)
+                        if state.get('previous_vote_rank') is not None:
+                             logger.debug(f"Token {token_key} dropped off leaderboard. Deleting previous_vote_rank from Redis.")
+                             # Use HDEL to remove the field cleanly
+                             await redis_client.hdel(redis_state_key, 'previous_vote_rank')
+                             # No need to add to redis_state_updates if we just deleted it
+                    except Exception as e: logger.error(f"Error checking/clearing previous rank from Redis for {token_key}: {e}")
+
+
+                    # --- Apply Redis State Updates ---
+                    if redis_state_updates:
+                        try:
+                            await redis_client.hset(redis_state_key, mapping=redis_state_updates)
+                            logger.debug(f"Updated Redis state for {token_key}: {redis_state_updates}")
+                        except Exception as e:
+                            logger.exception(f"Failed to update Redis state for {token_key}: {e}")
 
                 # --- Delay Between API Calls ---
-                api_delay = getattr(config, 'MARKET_API_DELAY_SECONDS', 1.1) # Default 1.1 if missing
+                api_delay = getattr(config, 'MARKET_API_DELAY_SECONDS', 1.1)
                 await asyncio.sleep(api_delay)
-
             # --- End of Token Fetch Loop ---
+
             logger.info("Finished fetching data for all tracked tokens in this cycle.")
 
-            # --- Biggest Gainers Post Logic (after token loop) ---
-            gainers_posted_this_cycle = False # Track if gainers post saved data
-            if not rate_limit_hit: # Only consider posting if the fetch cycle wasn't interrupted
+            # --- Biggest Gainers Post Logic ---
+            gainers_posted_this_cycle = False
+            if not rate_limit_hit:
                 can_post_gainers = False
-                # Check if feature is enabled using getattr for safety
                 if getattr(config, 'ENABLE_BIGGEST_GAINERS_POST', False):
-                    logger.debug("Checking if Biggest Gainers post should be sent.")
-                    if last_gainers_post_time is None: # Post if never posted before
-                        logger.info("Posting gainers: Never posted before.")
-                        can_post_gainers = True
-                    else:
-                        # Check if interval has passed since last post
-                        interval_duration = timedelta(minutes=config.BIGGEST_GAINERS_POST_INTERVAL_MINUTES)
-                        time_since_last = now - last_gainers_post_time
-                        logger.debug(f"Time since last gainers post: {time_since_last}. Interval required: {interval_duration}")
-                        if time_since_last >= interval_duration:
-                            logger.info(f"Posting gainers: Interval of {interval_duration} passed.")
-                            can_post_gainers = True
-                        else:
-                             logger.debug("Skipping gainers post: Interval not yet passed.")
-                else:
-                     logger.debug("Biggest Gainers post feature is disabled in config.")
+                    logger.debug("Checking gainers post timing.")
+                    interval_minutes = getattr(config, 'BIGGEST_GAINERS_POST_INTERVAL_MINUTES', 360) # Default 6 hours
+                    if last_gainers_post_time is None or now >= last_gainers_post_time + timedelta(minutes=interval_minutes):
+                         can_post_gainers = True
+                         logger.info("Conditions met for posting biggest gainers.")
+                    else: logger.debug("Skipping gainers post: Interval not yet passed.")
+                else: logger.debug("Biggest Gainers post feature disabled.")
 
                 if can_post_gainers:
-                     try:
-                         # --- FIX: Added await ---
-                         await send_biggest_gainers_post() # This function saves data if it posts
-                         gainers_posted_this_cycle = True # Assume save happened if no error
-                     except Exception as gainer_err:
-                          logger.exception(f"Error occurred during send_biggest_gainers_post: {gainer_err}")
-            else:
-                 logger.info("Skipping Biggest Gainers post check due to rate limit hit during fetch cycle.")
+                    try: await send_biggest_gainers_post(); gainers_posted_this_cycle = True
+                    except Exception as gainer_err: logger.exception(f"Error sending gainers post: {gainer_err}")
+            else: logger.info("Skipping Gainers post due to rate limit hit.")
 
-            # --- Save Data if Changed During Cycle AND NOT saved by gainers post ---
-            if data_changed and not gainers_posted_this_cycle:
-                 logger.info("Saving updated market data/state after fetch cycle...")
-                 await save_data()
-            elif data_changed and gainers_posted_this_cycle:
-                logger.info("Data changes occurred, but assuming send_biggest_gainers_post handled the save for this cycle.")
-            elif not data_changed:
-                logger.debug("No data changes detected in market data/state during this cycle, skipping final save.")
+            # --- Save JSON Data ---
+            # Only save if JSON-specific data changed AND gainers didn't already save it
+            if data_changed_json and not gainers_posted_this_cycle:
+                logger.info("Saving JSON data (token_cache/market_state changes) after market cycle.")
+                await save_data()
+            elif data_changed_json and gainers_posted_this_cycle:
+                logger.info("JSON data changed, but assuming send_biggest_gainers_post handled the save.")
+            elif not data_changed_json:
+                logger.debug("No JSON data changes detected in market cycle, skipping save.")
 
             logger.info("Market data update cycle finished.")
 
-        # --- End of Outer Task Loop Try/Except ---
-        except Exception as e:
-            logger.exception(f"Critical error in periodic_market_data_update main loop: {e}")
-            update_interval_seconds = 120 # Wait longer before retrying the whole loop
+        # --- ERROR HANDLING FOR THE ENTIRE CYCLE ---
+        except Exception as e: # Catch errors in the main loop logic
+            logger.exception(f"CRITICAL error in periodic_market_data_update main loop: {e}")
+            # Reset interval temporarily to avoid spamming errors if loop fails instantly
+            update_interval_seconds = 120 # Wait 2 minutes before full retry
             logger.error(f"Pausing market data task for {update_interval_seconds}s due to loop error.")
 
-        # Wait for the next full interval
-        logger.debug(f"Market data task sleeping for {update_interval_seconds} seconds.")
-        await asyncio.sleep(update_interval_seconds)
+        # --- FINALLY BLOCK - ALWAYS SLEEP ---
+        finally:
+            # This ensures the loop waits even if an error occurs before the normal sleep
+            logger.debug(f"Market data task sleeping for {update_interval_seconds} seconds.")
+            await asyncio.sleep(update_interval_seconds)
 
-# --- Minigame Handlers --- (Keep as is)
+
+# bot.py
+
 async def process_minigame(message: Message, emoji: str):
-    """Handles the logic for bowling and darts minigames."""
+    """Handles the logic for minigames using Redis."""
+    if not redis_client:
+         logger.error("Redis client not available in process_minigame")
+         await message.reply("Internal error: Cannot access game data. Please try again later.")
+         return
+
     user = message.from_user; chat_id = message.chat.id;
     chat_id_str = str(chat_id); user_id_str = str(user.id);
-    user_name = user.username if user.username else user.first_name # Use first name as fallback
-    logger.info(f"User {user.id} ({user_name}) initiated minigame ({emoji}) in chat {chat_id}")
+    user_name = user.username if user.username else user.first_name
 
-    # 1. Check if group is configured and active
+    # 1. Check if group is configured
     group_data = group_configs.get(chat_id_str)
     if not group_data or not group_data.get("config", {}).get("setup_complete") or not group_data.get("config", {}).get("is_active"):
-        logger.warning(f"Minigame attempt in unconfigured/inactive group {chat_id_str} by user {user.id}")
-        await message.reply("Minigames can only be played in groups where the bot is fully configured and active."); return
+        await message.reply("Minigames can only be played in configured groups."); return
 
     # 2. Get the token key for the reward
     token_key = group_data.get("token_key");
     if not token_key:
-        logger.error(f"Minigame attempt in configured group {chat_id_str} failed: Missing token_key in config.");
-        await message.reply("Configuration error: Cannot determine which token reward to give. Please contact an admin."); return
+        logger.error(f"Minigame failed in group {chat_id_str}: Missing token_key.");
+        await message.reply("Configuration error: Cannot determine token reward."); return
 
-    # 3. Check minigame cooldown for the user
-    logger.debug(f"Checking minigame cooldown for user {user.id}")
-    cooldown = get_minigame_cooldown_remaining(user.id); # Helper function handles cleanup
+    # 3. Check minigame cooldown using Redis TTL
+    logger.debug(f"Checking Redis minigame cooldown for user {user.id_str}")
+    cooldown = await get_minigame_cooldown_remaining(user.id) # Use the refactored helper
     if cooldown:
-        await message.reply(f"⏳ Easy there! You can play the minigame again in <b>{format_timedelta(cooldown)}</b>."); return
+        await message.reply(f"⏳ Easy there! You can play again in <b>{format_timedelta(cooldown)}</b>."); return
 
-    # 4. Send the dice animation
+    # 4. Send the dice
     try:
-        logger.debug(f"Sending dice {emoji} to chat {chat_id} for user {user.id}")
-        # Reply to the user's command message to keep context
         sent_dice_msg = await bot.send_dice(chat_id=chat_id, emoji=emoji, reply_to_message_id=message.message_id);
-        dice_value = sent_dice_msg.dice.value # Get the result value (1-6 for bowl/darts)
+        dice_value = sent_dice_msg.dice.value
         logger.info(f"User {user.id} rolled {emoji} in chat {chat_id}, result: {dice_value}")
     except Exception as e:
-        logger.exception(f"Failed to send dice emoji {emoji} for user {user.id} in chat {chat_id}: {e}");
-        await message.reply(f"Oops! Something went wrong trying to roll the {emoji}. Please try again later."); return
+        logger.exception(f"Failed to send dice emoji {emoji} for user {user.id}: {e}");
+        await message.reply(f"Oops! Couldn't roll the {emoji}."); return
 
-    # 5. Determine win condition and reward
+    # 5. Determine win condition
     win_value = config.MINIGAME_WIN_VALUES.get(emoji);
     if win_value is None:
-        logger.error(f"Minigame configuration error: No win value defined for emoji '{emoji}' in config.MINIGAME_WIN_VALUES");
-        await message.reply("Internal configuration error for this minigame. Cannot determine win condition."); return
+        logger.error(f"Minigame config error: No win value for {emoji}");
+        await message.reply("Internal configuration error."); return
 
     is_win = (dice_value == win_value);
-    reward_message = "" # Initialize reward message part
-    data_changed = False # Flag if save needed
+    reward_message = ""
+
+    # 6. Handle Win/Loss and Update Redis
+    redis_tasks = [] # List to run Redis operations concurrently
+    now = datetime.now(timezone.utc) # Get current time once
+
+    # Always set the cooldown with expiration
+    cooldown_seconds = int(timedelta(hours=config.MINIGAME_COOLDOWN_HOURS).total_seconds())
+    redis_key_cd = f"minigame_cd:{user_id_str}"
+    redis_tasks.append(
+        redis_client.setex(redis_key_cd, cooldown_seconds, now.isoformat())
+    )
+    logger.debug(f"Setting Redis minigame cooldown for {user_id_str} with TTL {cooldown_seconds}s")
 
     if is_win:
-        # --- Handle Win ---
-        logger.info(f"User {user.id} WON the minigame ({emoji})!")
-        # Increment free vote count
-        if user_id_str not in user_free_votes: user_free_votes[user_id_str] = {}; data_changed = True
-        if token_key not in user_free_votes[user_id_str]: user_free_votes[user_id_str][token_key] = 0; data_changed = True
-        # Only change data if count actually increases
-        if config.FREE_VOTE_REWARD_COUNT > 0:
-             user_free_votes[user_id_str][token_key] += config.FREE_VOTE_REWARD_COUNT
-             data_changed = True
-
-        # Format win message
+        logger.info(f"User {user.id} WON minigame ({emoji})!")
         try: token_display = await get_token_display_info(token_key);
         except: token_display = f"Token ({token_key[:6]}...)"
         win_desc = "Strike! 🎳" if emoji == "🎳" else "Bullseye! 🎯";
         reward_message = f"\n🎉 <b>{win_desc}</b> Congratulations, {user_name}! You won <b>{config.FREE_VOTE_REWARD_COUNT}</b> free vote(s) for {token_display}!";
-        logger.info(f"User {user.id} won minigame ({emoji}) in chat {chat_id}, earning {config.FREE_VOTE_REWARD_COUNT} free votes for {token_key}.")
+
+        # Increment free vote count atomically in Redis
+        if config.FREE_VOTE_REWARD_COUNT > 0:
+            redis_key_free = f"free_votes:{user_id_str}"
+            redis_tasks.append(
+                redis_client.hincrby(redis_key_free, token_key, config.FREE_VOTE_REWARD_COUNT)
+            )
+            logger.info(f"Incrementing free votes for {user_id_str}/{token_key} by {config.FREE_VOTE_REWARD_COUNT}")
+
     else:
-        # --- Handle Loss ---
-        logger.info(f"User {user.id} lost the minigame ({emoji}). Roll: {dice_value}, Needed: {win_value}")
-        lose_desc = "Close!" # Default loss message
+        logger.info(f"User {user.id} lost minigame ({emoji}).")
+        lose_desc = "Close!"
         if emoji == "🎳": lose_desc = "Gutter ball!" if dice_value == 1 else "So close!"
         elif emoji == "🎯": lose_desc = "Missed!" if dice_value == 1 else "Almost!"
         reward_message = f"\n😅 {lose_desc} Nice try, {user_name}! No win this time."
 
-    # 6. Set cooldown (always happens after playing)
-    logger.debug(f"Setting minigame cooldown for user {user.id}")
-    minigame_cooldowns[user_id_str] = datetime.now(timezone.utc).isoformat();
-    data_changed = True # Cooldown always changes data
-
-    # Save data IF needed (win occurred or cooldown set - always true here)
-    if data_changed:
-        logger.debug("Saving minigame results (cooldown and/or free votes).")
-        await save_data()
-
-    # 7. Send the result message including cooldown info
-    cooldown_notice = f"\nYou can play again in {config.MINIGAME_COOLDOWN_HOURS} hours.";
-    # Append cooldown notice to the win/loss message
-    full_reply = f"{reward_message.strip()}\n{cooldown_notice}" # Ensure single newline
+    # Execute Redis operations
     try:
-        await message.reply(full_reply) # Reply to the original command
-    except Exception as e:
-         logger.error(f"Failed to send minigame result reply to chat {chat_id}: {e}")
+        await asyncio.gather(*redis_tasks)
+        logger.debug(f"Executed {len(redis_tasks)} Redis operations for minigame result.")
+    except Exception as redis_e:
+         logger.exception(f"Error updating Redis after minigame for user {user.id}: {redis_e}")
+         # Inform user, but cooldown might already be set
+         await message.reply("An error occurred saving the game result. Please contact support if issues persist.")
+         return
+
+    # 7. Send result message
+    cooldown_notice = f"\nYou can play again in {config.MINIGAME_COOLDOWN_HOURS} hours.";
+    full_reply = f"{reward_message.strip()}\n{cooldown_notice}"
+    try: await message.reply(full_reply)
+    except Exception as e: logger.error(f"Failed to send minigame result reply to chat {chat_id}: {e}")
 
 @router.message(Command("bowl"), F.chat.type.in_([ChatType.GROUP, ChatType.SUPERGROUP]))
 async def handle_bowl_command(message: Message):
@@ -3300,15 +3292,34 @@ async def handle_darts_command(message: Message):
 
 # --- Main Execution ---
 async def main():
-    global http_session
+    global http_session, redis_client # Add redis_client here
     logger.info("Initializing bot...")
-    # Initialize aiohttp session at startup
+    # Initialize aiohttp session
     http_session = aiohttp.ClientSession()
     logger.info("aiohttp session initialized.")
 
-    # Load persistent data
+    # --- Initialize Redis Client ---
+    try:
+        # Use settings from config.py if available, otherwise defaults
+        redis_host = getattr(config, 'REDIS_HOST', 'localhost')
+        redis_port = getattr(config, 'REDIS_PORT', 6379)
+        redis_db = 0 # Use DB 0 (or choose another if needed)
+        redis_url = f"redis://{redis_host}:{redis_port}/{redis_db}"
+        redis_client = redis.Redis.from_url(redis_url, decode_responses=True) # decode_responses=True is important!
+        # Test connection
+        await redis_client.ping()
+        logger.info(f"Redis client connected successfully to {redis_host}:{redis_port}/{redis_db}")
+    except Exception as e:
+        logger.exception(f"CRITICAL: Failed to connect to Redis at {redis_host}:{redis_port} - {e}")
+        # Decide how to handle failure - exit or run degraded? Let's exit for now.
+        logger.error("Bot cannot function without Redis connection. Exiting.")
+        # Clean up existing session if needed before exiting
+        if http_session and not http_session.closed: await http_session.close()
+        return # Exit the main function
+
+    # Load persistent data (JSON parts)
     logger.info("Loading data from files...")
-    await load_data()
+    await load_data() # load_data will be modified later
     logger.info("Data loading complete.")
 
     # Include the router containing all handlers
@@ -3382,6 +3393,15 @@ async def main():
                  else:
                       logger.error(f"Result index {i} out of bounds for background tasks (length {len(background_tasks)})")
              logger.info("Finished waiting for background tasks.")
+
+        # --- Close Redis Client ---
+        if redis_client:
+             logger.info("Closing Redis client connection...")
+             try:
+                 await redis_client.close()
+                 logger.info("Redis client connection closed.")
+             except Exception as e:
+                  logger.exception(f"Error closing Redis client connection: {e}")
 
         # 3. Close aiohttp session
         if http_session and not http_session.closed:
